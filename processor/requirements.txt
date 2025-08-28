@@ -1,0 +1,6 @@
+numpy
+pynwb
+requests
+boto3
+backoff
+pyedflib==0.1.40

@@ -1,0 +1,10 @@
+services:
+  processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - dev.env
+    volumes:
+      - /Users/ddefreitas/Downloads/D03:/data/input
+      - ./data/output:/data/output
