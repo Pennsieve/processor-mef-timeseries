@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - dev.env
+      - .env
     volumes:
       - /Users/ddefreitas/Downloads/D03:/data/input
       - ./data/output:/data/output

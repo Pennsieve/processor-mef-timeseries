@@ -314,7 +314,6 @@ if __name__ == "__main__":
     STAGED_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Optional: stage from streaming jar
     log.info(getattr(config, "STREAM_FROM_JAR", True))
     if getattr(config, "STREAM_FROM_JAR", True):
         java_cmd = getattr(config, "JAVA_CMD", None)

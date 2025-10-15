@@ -65,3 +65,4 @@ cover/
 .idea/
 
 mefstreamer.jar
+.env
