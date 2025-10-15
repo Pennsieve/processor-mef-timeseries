@@ -6,6 +6,7 @@ import select
 import struct
 import subprocess
 import sys
+import requests
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -301,6 +302,72 @@ def get_start_time(json_path: Path) -> int:
         m = json.load(f)
     return min(int(s["start_us"]) for s in m["segments"]) if m["segments"] else 0
 
+def getIntegrationId():
+    integration_id = os.getenv("INTEGRATION_ID", None)
+    if not integration_id:
+        raise RuntimeError("INTEGRATION_ID environment variable is not set")
+    return integration_id
+
+def get_integration(api_host: str, integration_id: str, session_token: str) -> bytes:
+    """
+    Fetch an integration from the API and return its raw response body (bytes).
+    Raises an exception if the request fails.
+    """
+    url = f"{api_host}/integrations/{integration_id}"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {session_token}"
+    }
+
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()  
+    return response.json()
+
+
+def update_package_properties(api_host: str, node_id: str, api_key: str) -> int:
+    """
+    Updates a package's properties on the Pennsieve API.
+
+    Args:
+        api_host (str): The API host (e.g. "api.pennsieve.io")
+        node_id (str): The package (node) ID
+        api_key (str): The user's API key for authentication
+
+    Returns:
+        int: The HTTP status code from the response
+    """
+    url = f"{api_host}/packages/{node_id}?updateStorage=true&api_key={api_key}"
+
+    payload = {
+        "properties": [
+            {
+                "key": "subtype",
+                "value": "Pennsieve Timeseries",
+                "dataType": "string",
+                "category": "Viewer",
+                "fixed": False,
+                "hidden": False
+            },
+            {
+                "key": "icon",
+                "value": "Timeseries",
+                "dataType": "string",
+                "category": "Pennsieve",
+                "fixed": False,
+                "hidden": False
+            }
+        ]
+    }
+
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json"
+    }
+
+    response = requests.put(url, json=payload, headers=headers)
+    return response.status_code
+
+
 
 if __name__ == "__main__":
     config = Config()
@@ -354,4 +421,18 @@ if __name__ == "__main__":
             str(OUTPUT_DIR),
         )
 
-    log.info("Done.")
+    # Set attributes on collection
+    session_token = os.getenv("SESSION_TOKEN", None)
+    integration_id = config.WORKFLOW_INSTANCE_ID
+    integration_payload = get_integration(config.API_HOST, integration_id, session_token)
+    package_id = integration_payload.get("packageId", None)
+
+    if package_id:
+        status_code = update_package_properties(config.API_HOST, package_id, config.API_KEY)
+        if status_code == 200:
+            log.info(f"Successfully updated package {package_id} properties")
+        else:
+            log.error(f"Failed to update package {package_id} properties, status code: {status_code}")
+    else:
+        log.error("No packageId found in integration payload; cannot update package properties")
+
