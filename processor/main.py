@@ -376,6 +376,9 @@ if __name__ == "__main__":
     BYTES_PER_SAMPLE = 8  # float64 for writer output
     chunk_size_samples = int(getattr(config, "CHUNK_SIZE_MB", 8) * BYTES_PER_MB / BYTES_PER_SAMPLE)
 
+    log.info("Listing input dir before running Java:")
+    subprocess.run(["ls", "-lh", "/data/input"])
+
     STAGED_DIR = Path(getattr(config, "INPUT_DIR", "/data/input")).resolve()
     OUTPUT_DIR = Path(getattr(config, "OUTPUT_DIR", "/data/output")).resolve()
     STAGED_DIR.mkdir(parents=True, exist_ok=True)
