@@ -5,7 +5,7 @@ class Config:
     def __init__(self):
         self.ENVIRONMENT          = os.getenv('ENVIRONMENT', 'local')
         self.STREAM_FROM_JAR      = os.getenv('STREAM_FROM_JAR', True)
-        self.JAVA_CMD             = os.getenv('JAVA_CMD','/opt/java/openjdk/bin/java -jar /processor/mefstreamer.jar /data/input')
+        self.JAVA_CMD             = os.getenv('JAVA_CMD',f'/opt/java/openjdk/bin/java -jar /processor/mefstreamer.jar {os.getenv('INPUT_DIR')}')
         self.HEADER_SIZE          = 5 
 
         if self.ENVIRONMENT == 'local':

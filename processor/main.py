@@ -376,13 +376,14 @@ if __name__ == "__main__":
     BYTES_PER_SAMPLE = 8  # float64 for writer output
     chunk_size_samples = int(getattr(config, "CHUNK_SIZE_MB", 8) * BYTES_PER_MB / BYTES_PER_SAMPLE)
 
-    STAGED_DIR = Path(getattr(config, "INPUT_DIR", "/data/input")).resolve()
+    INPUT_DIR = Path(getattr(config, "INPUT_DIR", "/data/input")).resolve()
     OUTPUT_DIR = Path(getattr(config, "OUTPUT_DIR", "/data/output")).resolve()
-    STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("Listing input dir before running Java:")
-    subprocess.run(["ls", "-lh", STAGED_DIR])
+    log.info(f"INPUT_DIR={INPUT_DIR}, OUTPUT_DIR={OUTPUT_DIR}")
+    subprocess.run(["ls", "-lh", INPUT_DIR])
 
     log.info(getattr(config, "STREAM_FROM_JAR", True))
     if getattr(config, "STREAM_FROM_JAR", True):
@@ -394,13 +395,13 @@ if __name__ == "__main__":
             import shlex
             java_cmd = shlex.split(java_cmd)
 
-        staged = stage_from_stream(java_cmd, STAGED_DIR)
+        staged = stage_from_stream(java_cmd, INPUT_DIR)
         log.info("Staged %d channels", len(staged))
 
     # Discover staged JSONs (from streaming or pre-staged)
-    chan_jsons = _iter_channel_jsons(STAGED_DIR)
+    chan_jsons = _iter_channel_jsons(INPUT_DIR)
     if not chan_jsons:
-        raise RuntimeError(f"No channel .json files in {STAGED_DIR}. "
+        raise RuntimeError(f"No channel .json files in {INPUT_DIR}. "
                            f"Either enable STREAM_FROM_JAR with JAVA_CMD, or pre-stage your channels.")
 
     session_start_us = min((get_start_time(p) for p in chan_jsons if p.exists()), default=0)
