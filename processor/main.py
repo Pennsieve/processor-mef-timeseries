@@ -208,7 +208,7 @@ def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> List[Path]:
 
     # Frame loop
     try:
-        for ftype, payload in _read_frames(proc.stdout, timeout=30):
+        for ftype, payload in _read_frames(proc.stdout, timeout=300):
             if ftype == CHANNEL_META:
                 # finalize previous channel if any
                 flush_channel()
@@ -288,7 +288,7 @@ def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> List[Path]:
         flush_channel()
         # if Java died early, log its return code
         try:
-            rc = proc.wait(timeout=5)
+            rc = proc.wait(timeout=300)
             log.info("Java process exited with code %s", rc)
         except Exception:
             log.warning("Java process still running; sending SIGTERM")
