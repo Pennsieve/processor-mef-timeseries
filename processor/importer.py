@@ -57,7 +57,7 @@ def import_timeseries(api_host, api2_host, api_key, api_secret, workflow_instanc
 
     # constraint until we implement (upstream) performing imports over directories
     # and specifying how to group time series files together into an imported package
-    assert len(workflow_instance.package_ids) == 1, "NWB post processor only supports a single package for import"
+    
     package_id = workflow_instance.package_ids[0]
 
     log.info(f"dataset_id={workflow_instance.dataset_id} package_id={package_id} starting import of time series files")

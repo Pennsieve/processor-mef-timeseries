@@ -120,7 +120,7 @@ def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> List[Path]:
         java_cmd,
         stdout=subprocess.PIPE,
         stderr=None,
-        bufsize=0,
+        bufsize=1024*1024,  # 1MB pipe buffer
     )
     log.info("Java process started with PID %s", proc.pid)
     assert proc.stdout is not None
@@ -233,7 +233,7 @@ def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> List[Path]:
                 seg_index += 1
                 seg_fname = f"{ch_base}_seg{seg_index:03d}.bin"
                 seg_path = staged_dir / seg_fname
-                seg_file = open(seg_path, "wb")
+                seg_file = open(seg_path, "wb",buffering=8*1024*1024)  # 8MB buffer)
                 seg_samples_written = 0
                 bytes_this_seg = 0
                 last_log_bytes = 0
@@ -323,6 +323,20 @@ def get_integration(api_host: str, integration_id: str, session_token: str) -> b
     response.raise_for_status()  
     return response.json()
 
+def get_parent_package_id(package_id,token) -> str:
+    config.API_HOST
+    parent_node_id =None
+    url = f"{config.API_HOST}/packages/{package_id}?includeAncestors=true&startAtEpoch=false&limit=100&offset=0"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    package_info = response.json()
+    parent_node_id = package_info["parent"]["content"]["nodeId"]
+
+    return parent_node_id
 
 def update_package_properties(api_host: str, node_id: str, api_key: str) -> int:
     """
@@ -402,7 +416,7 @@ if __name__ == "__main__":
     chan_jsons = _iter_channel_jsons(INPUT_DIR)
     if not chan_jsons:
         raise RuntimeError(f"No channel .json files in {INPUT_DIR}. "
-                           f"Either enable STREAM_FROM_JAR with JAVA_CMD, or pre-stage your channels.")
+                        f"Either enable STREAM_FROM_JAR with JAVA_CMD, or pre-stage your channels.")
 
     session_start_us = min((get_start_time(p) for p in chan_jsons if p.exists()), default=0)
     session_start_time = datetime.fromtimestamp(session_start_us / 1e6, tz=timezone.utc) if session_start_us else datetime.now(timezone.utc)
@@ -429,14 +443,16 @@ if __name__ == "__main__":
     session_token = os.getenv("SESSION_TOKEN", None)
     integration_id = config.WORKFLOW_INSTANCE_ID
     integration_payload = get_integration(config.API_HOST, integration_id, session_token)
-    package_id = integration_payload.get("packageId", None)
+    package_ids = integration_payload.get("packageIds", None)
+    
+    folder_node_id = get_parent_package_id(package_ids[0],session_token)
 
-    if package_id:
-        status_code = update_package_properties(config.API_HOST, package_id, config.API_KEY)
+    if folder_node_id:
+        status_code = update_package_properties(config.API_HOST, folder_node_id, config.API_KEY)
         if status_code == 200:
-            log.info(f"Successfully updated package {package_id} properties")
+            log.info(f"Successfully updated package parent folder {folder_node_id} properties")
         else:
-            log.error(f"Failed to update package {package_id} properties, status code: {status_code}")
+            log.error(f"Failed to update package parent folder {folder_node_id} properties, status code: {status_code}")
     else:
         log.error("No packageId found in integration payload; cannot update package properties")
 
