@@ -490,10 +490,10 @@ if __name__ == "__main__":
 
     session_token = os.getenv("SESSION_TOKEN", None)
     integration_id = config.WORKFLOW_INSTANCE_ID
-    integration_payload = get_integration(config.API_HOST, integration_id, session_token)
+    integration_payload = get_integration(config.API_HOST2, integration_id, session_token)
     package_ids = integration_payload.get("packageIds", None)
     
-    folder_node_id = get_parent_package_id(package_ids[0],session_token,config.API_HOST)
+    folder_node_id = get_parent_package_id(package_ids[0],session_token,config.API_HOST2)
     if getattr(config, "IMPORTER_ENABLED", False):
         import_timeseries(
             config.API_HOST,
