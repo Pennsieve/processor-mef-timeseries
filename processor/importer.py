@@ -31,7 +31,7 @@ for import into Pennsieve data ecosystem.
 # easily able to handle > 3 processors
 """
 
-def import_timeseries(api_host, api2_host, api_key, api_secret, workflow_instance_id, file_directory):
+def import_timeseries(api_host, api2_host, api_key, api_secret, workflow_instance_id,folder_node_id, file_directory):
     # gather all the time series files from the output directory
     timeseries_data_files = []
     timeseries_channel_files = []
@@ -58,7 +58,9 @@ def import_timeseries(api_host, api2_host, api_key, api_secret, workflow_instanc
     # constraint until we implement (upstream) performing imports over directories
     # and specifying how to group time series files together into an imported package
     
-    package_id = workflow_instance.package_ids[0]
+    # package_id = workflow_instance.package_ids[0]
+    # Uses the parent folder of the package as the target for the time series import
+    package_id= folder_node_id
 
     log.info(f"dataset_id={workflow_instance.dataset_id} package_id={package_id} starting import of time series files")
 
