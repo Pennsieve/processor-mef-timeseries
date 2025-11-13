@@ -10,7 +10,9 @@ import requests
 import time
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 import numpy as np
 
@@ -323,10 +325,9 @@ def get_integration(api_host: str, integration_id: str, session_token: str) -> b
     response.raise_for_status()  
     return response.json()
 
-def get_parent_package_id(package_id,token) -> str:
-    config.API_HOST
+def get_parent_package_id(package_id,token,api_host) -> str:
     parent_node_id =None
-    url = f"{config.API_HOST}/packages/{package_id}?includeAncestors=true&startAtEpoch=false&limit=100&offset=0"
+    url = f"{api_host}/packages/{package_id}?includeAncestors=true&startAtEpoch=false&limit=100&offset=0"
     headers = {
         "accept": "application/json",
         "Authorization": f"Bearer {token}"
@@ -381,6 +382,27 @@ def update_package_properties(api_host: str, node_id: str, api_key: str) -> int:
     response = requests.put(url, json=payload, headers=headers)
     return response.status_code
 
+def process_single_channel(args):
+    """Worker function for parallel channel processing"""
+    json_path, index, session_start_time, output_dir, chunk_size_samples = args
+    
+    import logging
+    
+    from processor.single_channel_reader import SingleChannelReader
+    from writer import TimeSeriesChunkWriter
+    
+    log = logging.getLogger(f"processor.channel.{index:05d}")
+    
+    try:
+        reader = SingleChannelReader(str(json_path), staged_dtype="auto", global_index=index)
+        writer = TimeSeriesChunkWriter(session_start_time, output_dir, chunk_size_samples)
+        log.info("Processing channel index %05d (%s)", index, json_path.name)
+        writer.write_electrical_series(reader)
+        log.info("Completed channel index %05d", index)
+        return index, True, None
+    except Exception as e:
+        log.error("Failed channel index %05d: %s", index, e, exc_info=True)
+        return index, False, str(e)
 
 
 if __name__ == "__main__":
@@ -422,12 +444,48 @@ if __name__ == "__main__":
     session_start_time = datetime.fromtimestamp(session_start_us / 1e6, tz=timezone.utc) if session_start_us else datetime.now(timezone.utc)
     log.info("Session start (UTC): %s", session_start_time.isoformat())
 
-    # Use staged_dtype='auto' so counts (<i4) vs floats (<f8) are inferred from JSON "unit"
-    for index, json_path in enumerate(chan_jsons):
-        reader = SingleChannelReader(str(json_path), staged_dtype="auto", global_index=index)
-        writer = TimeSeriesChunkWriter(session_start_time, str(OUTPUT_DIR), chunk_size_samples)
-        log.info("Writing channel index %05d (%s)", index, json_path.name)
-        writer.write_electrical_series(reader)
+    
+    channel_args = [
+        (json_path, index, session_start_time, str(OUTPUT_DIR), chunk_size_samples)
+        for index, json_path in enumerate(chan_jsons)
+    ]
+
+    # Start with half CPU cores for testing
+    num_workers = config.NUM_WORKERS
+    log.info("Processing %d channels with %d parallel workers", len(chan_jsons), num_workers)
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_single_channel, args): args[1] for args in channel_args}
+        
+        completed = 0
+        failed = []  # Track failures
+        
+        for future in as_completed(futures):
+            index = futures[future]  # Get the index from our mapping
+            try:
+                idx, success, error = future.result()
+                completed += 1
+                
+                if success:
+                    log.info("✓ Channel %05d complete (%d/%d)", idx, completed, len(chan_jsons))
+                else:
+                    log.error("✗ Channel %05d FAILED: %s", idx, error)
+                    failed.append(idx)
+                    
+            except Exception as e:
+                # Catch any unexpected exceptions from the worker
+                log.error("✗ Channel %05d CRASHED: %s", index, e, exc_info=True)
+                failed.append(index)
+                completed += 1
+        
+        # Summary
+        log.info("="*80)
+        log.info("Channel processing complete: %d succeeded, %d failed", 
+                len(chan_jsons) - len(failed), len(failed))
+        if failed:
+            log.error("Failed channels: %s", failed)
+            # Optional: Decide if failures should stop the pipeline
+            # raise RuntimeError(f"Failed to process {len(failed)} channels")
 
     if getattr(config, "IMPORTER_ENABLED", False):
         import_timeseries(
@@ -445,7 +503,7 @@ if __name__ == "__main__":
     integration_payload = get_integration(config.API_HOST, integration_id, session_token)
     package_ids = integration_payload.get("packageIds", None)
     
-    folder_node_id = get_parent_package_id(package_ids[0],session_token)
+    folder_node_id = get_parent_package_id(package_ids[0],session_token,config.API_HOST)
 
     if folder_node_id:
         status_code = update_package_properties(config.API_HOST, folder_node_id, config.API_KEY)

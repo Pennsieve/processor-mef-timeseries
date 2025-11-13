@@ -1,5 +1,6 @@
 import os
 import uuid
+import multiprocessing
 
 class Config:
     def __init__(self):
@@ -7,6 +8,7 @@ class Config:
         self.STREAM_FROM_JAR      = os.getenv('STREAM_FROM_JAR', True)
         self.JAVA_CMD             = os.getenv('JAVA_CMD',f'/opt/java/openjdk/bin/java -jar /processor/mefstreamer.jar {os.getenv('INPUT_DIR')}')
         self.HEADER_SIZE          = 5  # MEF HEADER is 5 bytes
+        self.NUM_WORKERS          = int(os.getenv('NUM_WORKERS', max(1, multiprocessing.cpu_count() // 2))) # default to half of available CPU while testing
 
         if self.ENVIRONMENT == 'local':
             self.INPUT_DIR            = os.getenv('INPUT_DIR')
