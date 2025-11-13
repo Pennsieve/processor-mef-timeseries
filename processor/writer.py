@@ -59,7 +59,7 @@ class TimeSeriesChunkWriter:
         file_name = "channel-{}_{}_{}{}".format(channel_index, int(start_time * 1e6), int(end_time * 1e6), TIME_SERIES_BINARY_FILE_EXTENSION)
         file_path = os.path.join(self.output_dir, file_name)
 
-        with gzip.open(file_path, 'wb') as f:
+        with gzip.open(file_path, 'wb', compresslevel=1) as f:
             f.write(formatted_data)
 
     def write_channel(self, channel):
