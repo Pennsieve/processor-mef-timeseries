@@ -20,6 +20,7 @@ from config import Config
 from importer import import_timeseries
 from writer import TimeSeriesChunkWriter
 from processor.single_channel_reader import SingleChannelReader
+from processor.clients.authentication_client import AuthenticationClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -310,28 +311,63 @@ def getIntegrationId():
         raise RuntimeError("INTEGRATION_ID environment variable is not set")
     return integration_id
 
-def get_integration(api_host: str, integration_id: str, session_token: str) -> bytes:
+def get_integration(api_host: str, integration_id: str, session_token: str) -> dict:
     """
-    Fetch an integration from the API and return its raw response body (bytes).
+    Fetch an integration from the API and return its JSON response.
     Raises an exception if the request fails.
+
+    Args:
+        api_host: The API host URL
+        integration_id: The integration ID to fetch
+        session_token: A valid session/access token for authentication
+
+    Returns:
+        dict: The integration data
+
+    Raises:
+        RuntimeError: If session_token is None or empty
+        requests.HTTPError: If the API request fails (e.g., 403 Forbidden)
     """
+    if not session_token:
+        raise RuntimeError("session_token is required but was not provided")
+
     url = f"{api_host}/integrations/{integration_id}"
     headers = {
         "accept": "application/json",
         "Authorization": f"Bearer {session_token}"
     }
 
+    log.info(f"Fetching integration from: {url}")
     response = requests.get(url, headers=headers)
-    response.raise_for_status()  
+    response.raise_for_status()
     return response.json()
 
-def get_parent_package_id(package_id,token,api_host) -> str:
-    parent_node_id =None
+def get_parent_package_id(package_id: str, token: str, api_host: str) -> str:
+    """
+    Get the parent package ID for a given package.
+
+    Args:
+        package_id: The package ID to query
+        token: A valid session/access token for authentication
+        api_host: The API host URL
+
+    Returns:
+        str: The parent node ID
+
+    Raises:
+        RuntimeError: If token is None or empty
+        requests.HTTPError: If the API request fails
+    """
+    if not token:
+        raise RuntimeError("token is required but was not provided")
+
     url = f"{api_host}/packages/{package_id}?includeAncestors=true&startAtEpoch=false&limit=100&offset=0"
     headers = {
         "accept": "application/json",
         "Authorization": f"Bearer {token}"
     }
+
+    log.info(f"Fetching parent package ID for package: {package_id}")
     response = requests.get(url, headers=headers)
     response.raise_for_status()
     package_info = response.json()
@@ -488,12 +524,24 @@ if __name__ == "__main__":
             # raise RuntimeError(f"Failed to process {len(failed)} channels")
 
 
-    session_token = os.getenv("SESSION_TOKEN", None)
+    # Generate a fresh token right before we need it (the process before this can take hours)
+    log.info("Generating authentication token...")
+
+    if not config.API_KEY or not config.API_SECRET:
+        raise RuntimeError("PENNSIEVE_API_KEY and PENNSIEVE_API_SECRET environment variables must be set")
+
+    auth_client = AuthenticationClient(config.API_HOST)
+    session_token = auth_client.authenticate(config.API_KEY, config.API_SECRET)
+    log.info("Authentication token generated successfully")
+
     integration_id = config.WORKFLOW_INSTANCE_ID
     integration_payload = get_integration(config.API_HOST2, integration_id, session_token)
     package_ids = integration_payload.get("packageIds", None)
-    
-    folder_node_id = get_parent_package_id(package_ids[0],session_token,config.API_HOST2)
+
+    if not package_ids:
+        raise RuntimeError("No packageIds found in integration payload")
+
+    folder_node_id = get_parent_package_id(package_ids[0], session_token, config.API_HOST2)
     if getattr(config, "IMPORTER_ENABLED", False):
         import_timeseries(
             config.API_HOST,
