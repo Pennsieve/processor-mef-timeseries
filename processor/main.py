@@ -541,7 +541,7 @@ if __name__ == "__main__":
     if not package_ids:
         raise RuntimeError("No packageIds found in integration payload")
 
-    folder_node_id = get_parent_package_id(package_ids[0], session_token, config.API_HOST2)
+    folder_node_id = get_parent_package_id(package_ids[0], session_token, config.API_HOST)
     if getattr(config, "IMPORTER_ENABLED", False):
         import_timeseries(
             config.API_HOST,
