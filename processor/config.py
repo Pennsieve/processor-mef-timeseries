@@ -14,11 +14,8 @@ class Config:
             self.INPUT_DIR            = os.getenv('INPUT_DIR')
             self.OUTPUT_DIR           = os.getenv('OUTPUT_DIR')
         else:
-            # workflow / analysis pipeline only supports 3 processors (pre-, main, post-)
-            # the output directory of the main processor is what the post-processor needs to read from
-            # so for now we will set the input directory for this processor to be the output directory variable
-            self.INPUT_DIR            = os.getenv('OUTPUT_DIR')
-            self.OUTPUT_DIR           = os.path.join(self.INPUT_DIR, "output")
+            self.INPUT_DIR            = os.getenv('INPUT_DIR')
+            self.OUTPUT_DIR           = os.getenv('OUTPUT_DIR')
             if not os.path.exists(self.OUTPUT_DIR):
                 os.makedirs(self.OUTPUT_DIR)
 
