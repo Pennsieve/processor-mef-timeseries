@@ -375,47 +375,61 @@ def get_parent_package_id(package_id: str, token: str, api_host: str) -> str:
 
     return parent_node_id
 
-def update_package_properties(api_host: str, node_id: str, api_key: str) -> int:
+def update_package_properties(api_host: str, node_id: str, token: str) -> int:
     """
     Updates a package's properties on the Pennsieve API.
 
     Args:
         api_host (str): The API host (e.g. "api.pennsieve.io")
         node_id (str): The package (node) ID
-        api_key (str): The user's API key for authentication
+        token (str): An authenticated session token
 
     Returns:
         int: The HTTP status code from the response
     """
-    url = f"{api_host}/packages/{node_id}?updateStorage=true&api_key={api_key}"
+    if not token:
+        raise RuntimeError("token is required but was not provided")
+
+    url = f"{api_host}/packages/{node_id}?updateStorage=true"
 
     payload = {
         "properties": [
             {
                 "key": "subtype",
-                "value": "Pennsieve Timeseries",
+                "value": "pennsieve_timeseries",
                 "dataType": "string",
                 "category": "Viewer",
                 "fixed": False,
-                "hidden": False
+                "hidden": True
             },
             {
                 "key": "icon",
-                "value": "Timeseries",
+                "value": "timeseries",
                 "dataType": "string",
                 "category": "Pennsieve",
                 "fixed": False,
-                "hidden": False
+                "hidden": True
             }
         ]
     }
 
     headers = {
         "accept": "*/*",
-        "content-type": "application/json"
+        "content-type": "application/json",
+        "Authorization": f"Bearer {token}",
     }
 
+    log.info("Updating package %s properties via %s", node_id, url)
+    log.info("Property payload: %s", payload)
     response = requests.put(url, json=payload, headers=headers)
+    log.info(
+        "Package %s properties update status: %s %s",
+        node_id,
+        response.status_code,
+        response.reason,
+    )
+    if response.text:
+        log.info("Property update response body: %s", response.text)
     return response.status_code
 
 def process_single_channel(args):
@@ -555,11 +569,10 @@ if __name__ == "__main__":
 
     # Set attributes on collection
     if folder_node_id:
-        status_code = update_package_properties(config.API_HOST, folder_node_id, config.API_KEY)
+        status_code = update_package_properties(config.API_HOST, folder_node_id, session_token)
         if status_code == 200:
             log.info(f"Successfully updated package parent folder {folder_node_id} properties")
         else:
             log.error(f"Failed to update package parent folder {folder_node_id} properties, status code: {status_code}")
     else:
         log.error("No packageId found in integration payload; cannot update package properties")
-
