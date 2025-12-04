@@ -19,7 +19,7 @@ class Config:
             if not os.path.exists(self.OUTPUT_DIR):
                 os.makedirs(self.OUTPUT_DIR)
 
-        self.CHUNK_SIZE_MB        = int(os.getenv('CHUNK_SIZE_MB', '1'))
+        self.CHUNK_SIZE_MB        = int(os.getenv('CHUNK_SIZE_MB', '100'))
 
         # continue to use INTEGRATION_ID environment variable until runner
         # has been converted to use  a different variable to represent the workflow instance ID
