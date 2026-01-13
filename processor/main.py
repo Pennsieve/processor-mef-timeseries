@@ -6,21 +6,16 @@ import select
 import struct
 import subprocess
 import sys
-import requests
 import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
 
 import numpy as np
 
 from config import Config
-from importer import import_timeseries
-from writer import TimeSeriesChunkWriter
-from processor.single_channel_reader import SingleChannelReader
-from processor.clients.authentication_client import AuthenticationClient
+from processor.multi_channel_reader import MultiChannelReader
+from processor.nwb_writer import MEFtoNWBWriter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -305,162 +300,9 @@ def get_start_time(json_path: Path) -> int:
         m = json.load(f)
     return min(int(s["start_us"]) for s in m["segments"]) if m["segments"] else 0
 
-def getIntegrationId():
-    integration_id = os.getenv("INTEGRATION_ID", None)
-    if not integration_id:
-        raise RuntimeError("INTEGRATION_ID environment variable is not set")
-    return integration_id
-
-def get_integration(api_host: str, integration_id: str, session_token: str) -> dict:
-    """
-    Fetch an integration from the API and return its JSON response.
-    Raises an exception if the request fails.
-
-    Args:
-        api_host: The API host URL
-        integration_id: The integration ID to fetch
-        session_token: A valid session/access token for authentication
-
-    Returns:
-        dict: The integration data
-
-    Raises:
-        RuntimeError: If session_token is None or empty
-        requests.HTTPError: If the API request fails (e.g., 403 Forbidden)
-    """
-    if not session_token:
-        raise RuntimeError("session_token is required but was not provided")
-
-    url = f"{api_host}/integrations/{integration_id}"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {session_token}"
-    }
-
-    log.info(f"Fetching integration from: {url}")
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
-
-def get_parent_package_id(package_id: str, token: str, api_host: str) -> str:
-    """
-    Get the parent package ID for a given package.
-
-    Args:
-        package_id: The package ID to query
-        token: A valid session/access token for authentication
-        api_host: The API host URL
-
-    Returns:
-        str: The parent node ID
-
-    Raises:
-        RuntimeError: If token is None or empty
-        requests.HTTPError: If the API request fails
-    """
-    if not token:
-        raise RuntimeError("token is required but was not provided")
-
-    url = f"{api_host}/packages/{package_id}?includeAncestors=true&startAtEpoch=false&limit=100&offset=0"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    log.info(f"Fetching parent package ID for package: {package_id}")
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    package_info = response.json()
-    parent_node_id = package_info["parent"]["content"]["nodeId"]
-
-    return parent_node_id
-
-def update_package_properties(api_host: str, node_id: str, token: str) -> int:
-    """
-    Updates a package's properties on the Pennsieve API.
-
-    Args:
-        api_host (str): The API host (e.g. "api.pennsieve.io")
-        node_id (str): The package (node) ID
-        token (str): An authenticated session token
-
-    Returns:
-        int: The HTTP status code from the response
-    """
-    if not token:
-        raise RuntimeError("token is required but was not provided")
-
-    url = f"{api_host}/packages/{node_id}?updateStorage=true"
-
-    payload = {
-        "properties": [
-            {
-                "key": "subtype",
-                "value": "pennsieve_timeseries",
-                "dataType": "string",
-                "category": "Viewer",
-                "fixed": False,
-                "hidden": True
-            },
-            {
-                "key": "icon",
-                "value": "timeseries",
-                "dataType": "string",
-                "category": "Pennsieve",
-                "fixed": False,
-                "hidden": True
-            }
-        ]
-    }
-
-    headers = {
-        "accept": "*/*",
-        "content-type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    log.info("Updating package %s properties via %s", node_id, url)
-    log.info("Property payload: %s", payload)
-    response = requests.put(url, json=payload, headers=headers)
-    log.info(
-        "Package %s properties update status: %s %s",
-        node_id,
-        response.status_code,
-        response.reason,
-    )
-    if response.text:
-        log.info("Property update response body: %s", response.text)
-    return response.status_code
-
-def process_single_channel(args):
-    """Worker function for parallel channel processing"""
-    json_path, index, session_start_time, output_dir, chunk_size_samples = args
-    
-    import logging
-    
-    from processor.single_channel_reader import SingleChannelReader
-    from writer import TimeSeriesChunkWriter
-    
-    log = logging.getLogger(f"processor.channel.{index:05d}")
-    
-    try:
-        reader = SingleChannelReader(str(json_path), staged_dtype="auto", global_index=index)
-        writer = TimeSeriesChunkWriter(session_start_time, output_dir, chunk_size_samples)
-        log.info("Processing channel index %05d (%s)", index, json_path.name)
-        writer.write_electrical_series(reader)
-        log.info("Completed channel index %05d", index)
-        return index, True, None
-    except Exception as e:
-        log.error("Failed channel index %05d: %s", index, e, exc_info=True)
-        return index, False, str(e)
-
 
 if __name__ == "__main__":
     config = Config()
-
-    BYTES_PER_MB = 2**20
-    BYTES_PER_SAMPLE = 8  # float64 for writer output
-    chunk_size_samples = int(getattr(config, "CHUNK_SIZE_MB", 8) * BYTES_PER_MB / BYTES_PER_SAMPLE)
 
     INPUT_DIR = Path(getattr(config, "INPUT_DIR", "/data/input")).resolve()
     OUTPUT_DIR = Path(getattr(config, "OUTPUT_DIR", "/data/output")).resolve()
@@ -490,89 +332,24 @@ if __name__ == "__main__":
         raise RuntimeError(f"No channel .json files in {INPUT_DIR}. "
                         f"Either enable STREAM_FROM_JAR with JAVA_CMD, or pre-stage your channels.")
 
-    session_start_us = min((get_start_time(p) for p in chan_jsons if p.exists()), default=0)
-    session_start_time = datetime.fromtimestamp(session_start_us / 1e6, tz=timezone.utc) if session_start_us else datetime.now(timezone.utc)
-    log.info("Session start (UTC): %s", session_start_time.isoformat())
+    log.info("Found %d channel JSON files", len(chan_jsons))
 
-    
-    channel_args = [
-        (json_path, index, session_start_time, str(OUTPUT_DIR), chunk_size_samples)
-        for index, json_path in enumerate(chan_jsons)
-    ]
+    # Load all channels via MultiChannelReader
+    log.info("Loading channel data...")
+    reader = MultiChannelReader(chan_jsons)
+    log.info("Channels: %d, Samples: %d, Rate: %.2f Hz",
+             reader.num_channels, reader.num_samples, reader.sampling_rate)
+    log.info("Session start: %s", reader.session_start_time.isoformat())
+    log.info("Has gaps: %s", reader.has_gaps())
 
-    # Start with half CPU cores for testing
-    num_workers = config.NUM_WORKERS
-    log.info("Processing %d channels with %d parallel workers", len(chan_jsons), num_workers)
+    # Write NWB file
+    output_nwb_filename = getattr(config, "NWB_OUTPUT_FILENAME", "output.nwb")
+    output_nwb_path = OUTPUT_DIR / output_nwb_filename
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(process_single_channel, args): args[1] for args in channel_args}
-        
-        completed = 0
-        failed = []  # Track failures
-        
-        for future in as_completed(futures):
-            index = futures[future]  # Get the index from our mapping
-            try:
-                idx, success, error = future.result()
-                completed += 1
-                
-                if success:
-                    log.info("✓ Channel %05d complete (%d/%d)", idx, completed, len(chan_jsons))
-                else:
-                    log.error("✗ Channel %05d FAILED: %s", idx, error)
-                    failed.append(idx)
-                    
-            except Exception as e:
-                # Catch any unexpected exceptions from the worker
-                log.error("✗ Channel %05d CRASHED: %s", index, e, exc_info=True)
-                failed.append(index)
-                completed += 1
-        
-        # Summary
-        log.info("="*80)
-        log.info("Channel processing complete: %d succeeded, %d failed", 
-                len(chan_jsons) - len(failed), len(failed))
-        if failed:
-            log.error("Failed channels: %s", failed)
-            # Optional: Decide if failures should stop the pipeline
-            # raise RuntimeError(f"Failed to process {len(failed)} channels")
+    writer = MEFtoNWBWriter(reader, output_nwb_path)
+    writer.write()
 
-
-    # Generate a fresh token right before we need it (the process before this can take hours)
-    log.info("Generating authentication token...")
-
-    if not config.API_KEY or not config.API_SECRET:
-        raise RuntimeError("PENNSIEVE_API_KEY and PENNSIEVE_API_SECRET environment variables must be set")
-
-    auth_client = AuthenticationClient(config.API_HOST)
-    session_token = auth_client.authenticate(config.API_KEY, config.API_SECRET)
-    log.info("Authentication token generated successfully")
-
-    integration_id = config.WORKFLOW_INSTANCE_ID
-    integration_payload = get_integration(config.API_HOST2, integration_id, session_token)
-    package_ids = integration_payload.get("packageIds", None)
-
-    if not package_ids:
-        raise RuntimeError("No packageIds found in integration payload")
-
-    folder_node_id = get_parent_package_id(package_ids[0], session_token, config.API_HOST)
-    if getattr(config, "IMPORTER_ENABLED", False):
-        import_timeseries(
-            config.API_HOST,
-            config.API_HOST2,
-            config.API_KEY,
-            config.API_SECRET,
-            config.WORKFLOW_INSTANCE_ID,
-            folder_node_id,
-            str(OUTPUT_DIR),
-        )
-
-    # Set attributes on collection
-    if folder_node_id:
-        status_code = update_package_properties(config.API_HOST, folder_node_id, session_token)
-        if status_code == 200:
-            log.info(f"Successfully updated package parent folder {folder_node_id} properties")
-        else:
-            log.error(f"Failed to update package parent folder {folder_node_id} properties, status code: {status_code}")
-    else:
-        log.error("No packageId found in integration payload; cannot update package properties")
+    log.info("=" * 80)
+    log.info("MEF to NWB conversion complete!")
+    log.info("Output file: %s", output_nwb_path)
+    log.info("=" * 80)

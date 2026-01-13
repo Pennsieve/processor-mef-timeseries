@@ -1,5 +1,4 @@
 import os
-import uuid
 import multiprocessing
 
 class Config:
@@ -19,18 +18,8 @@ class Config:
             if not os.path.exists(self.OUTPUT_DIR):
                 os.makedirs(self.OUTPUT_DIR)
 
-        self.CHUNK_SIZE_MB        = int(os.getenv('CHUNK_SIZE_MB', '100'))
-
-        # continue to use INTEGRATION_ID environment variable until runner
-        # has been converted to use  a different variable to represent the workflow instance ID
-        self.WORKFLOW_INSTANCE_ID = os.getenv('INTEGRATION_ID', str(uuid.uuid4()))
-
-        self.API_KEY              = os.getenv('PENNSIEVE_API_KEY')
-        self.API_SECRET           = os.getenv('PENNSIEVE_API_SECRET')
-        self.API_HOST             = os.getenv('PENNSIEVE_API_HOST', 'https://api.pennsieve.net')
-        self.API_HOST2            = os.getenv('PENNSIEVE_API_HOST2', 'https://api2.pennsieve.net')
-
-        self.IMPORTER_ENABLED     = getboolenv("IMPORTER_ENABLED", self.ENVIRONMENT != 'local')
+        # NWB output configuration
+        self.NWB_OUTPUT_FILENAME  = os.getenv('NWB_OUTPUT_FILENAME', 'output.nwb')
 
 def getboolenv(key, default=False):
     return os.getenv(key, str(default)).lower() in ('true', '1')
