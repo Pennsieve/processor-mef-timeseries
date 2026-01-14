@@ -25,6 +25,7 @@ log = logging.getLogger("processor")
 
 # MEFStreamer will output these frame types
 CHANNEL_META, SEGMENT_START, SAMPLES_INT32, SEGMENT_END, END = 1, 2, 3, 4, 5
+MEF_HEADER_SIZE = 5  # MEF HEADER is 5 bytes
 
 def _iter_channel_jsons(staged_dir: Path) -> list[Path]:
     """
@@ -89,8 +90,8 @@ def _read_frames(stream, timeout: int = 30):
         if not is_readable:
             raise TimeoutError(f"No data from Java for {timeout}s")
 
-        header_bytes = stream.read(config.HEADER_SIZE)
-        if not header_bytes or len(header_bytes) < config.HEADER_SIZE:
+        header_bytes = stream.read(MEF_HEADER_SIZE)
+        if not header_bytes or len(header_bytes) < MEF_HEADER_SIZE:
             return
 
         frame_type = header_bytes[0]
@@ -294,13 +295,6 @@ def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> List[Path]:
 
     return json_paths
 
-
-def get_start_time(json_path: Path) -> int:
-    with json_path.open() as f:
-        m = json.load(f)
-    return min(int(s["start_us"]) for s in m["segments"]) if m["segments"] else 0
-
-
 if __name__ == "__main__":
     config = Config()
 
@@ -343,7 +337,7 @@ if __name__ == "__main__":
     log.info("Has gaps: %s", reader.has_gaps())
 
     # Write NWB file
-    output_nwb_filename = getattr(config, "NWB_OUTPUT_FILENAME", "output.nwb")
+    output_nwb_filename = getattr(config, "OUTPUT_FILENAME", "output.nwb")
     output_nwb_path = OUTPUT_DIR / output_nwb_filename
 
     writer = MEFtoNWBWriter(reader, output_nwb_path)
