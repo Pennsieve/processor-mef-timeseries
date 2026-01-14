@@ -1,7 +1,8 @@
-# processor/nwb_writer.py
 """
-NWB file writer for MEF data.
-Constructs NWB files compatible with processor-post-timeseries.
+NWB file writer for MEF timeseries data.
+
+Produces NWB 2.x files with ElectricalSeries, compatible with
+downstream processing pipelines (e.g., processor-post-timeseries).
 """
 import logging
 import uuid
@@ -18,215 +19,125 @@ from processor.multi_channel_reader import MultiChannelReader
 log = logging.getLogger(__name__)
 
 
-class MEFDataChunkIterator(GenericDataChunkIterator):
-    """
-    Custom chunk iterator for MEF data that reads from MultiChannelReader.
-    Provides memory-efficient streaming of data to NWB file.
-    """
+class _ChunkedDataIterator(GenericDataChunkIterator):
+    """Streams channel data in chunks to avoid loading entire dataset into memory."""
 
-    def __init__(self, reader: MultiChannelReader, chunk_size: int = 100_000):
-        self.reader = reader
-        self._chunk_size = chunk_size
-        self._num_samples = reader.num_samples
-        self._num_channels = reader.num_channels
+    def __init__(self, reader: MultiChannelReader, chunk_samples: int):
+        self._reader = reader
+        self._shape = (reader.num_samples, reader.num_channels)
+        buffer = (min(chunk_samples, reader.num_samples), reader.num_channels)
 
-        # Calculate buffer shape (chunk of samples x all channels)
-        buffer_samples = min(chunk_size, self._num_samples)
-
-        super().__init__(
-            buffer_shape=(buffer_samples, self._num_channels),
-            chunk_shape=(buffer_samples, self._num_channels),
-            display_progress=True,
+        super().__init__(buffer_shape=buffer, chunk_shape=buffer, display_progress=True)
+        log.info(
+            "Chunk iterator: %d samples x %d channels, chunk=%d",
+            *self._shape, buffer[0],
         )
 
-        log.info("MEFDataChunkIterator initialized:")
-        log.info("  Total samples: %d", self._num_samples)
-        log.info("  Channels: %d", self._num_channels)
-        log.info("  Chunk size: %d samples", buffer_samples)
-
     def _get_data(self, selection: Tuple[slice, ...]) -> np.ndarray:
-        """Read data for the given selection."""
-        start = selection[0].start
-        stop = selection[0].stop
-        return self.reader.read_all_channels(start, stop).astype(np.float64)
+        return self._reader.read_all_channels(selection[0].start, selection[0].stop)
 
     def _get_maxshape(self) -> Tuple[int, int]:
-        """Return the maximum shape of the data."""
-        return (self._num_samples, self._num_channels)
+        return self._shape
 
     def _get_dtype(self) -> np.dtype:
-        """Return the data type."""
-        return np.dtype('float64')
+        return np.dtype("float64")
 
 
-class MEFtoNWBWriter:
+class NWBWriter:
     """
-    Writes MEF data to NWB format compatible with processor-post-timeseries.
+    Writes MEF channel data to NWB format.
 
-    Creates an NWB file with:
-    - ElectricalSeries in acquisition
-    - Electrode table with channel_name column
-    - Proper device and electrode group
+    The output file contains:
+      - Device and ElectrodeGroup metadata
+      - Electrode table with channel names
+      - ElectricalSeries with sample data (chunked for memory efficiency)
     """
 
     def __init__(
         self,
         reader: MultiChannelReader,
         output_path: Path,
-        chunk_size: int = 100_000,
+        chunk_samples: int = 100_000,
     ):
-        """
-        Initialize the NWB writer.
-
-        Args:
-            reader: MultiChannelReader with loaded channel data
-            output_path: Path to write the NWB file
-            chunk_size: Number of samples to read/write at a time (for memory efficiency)
-        """
-        self.reader = reader
-        self.output_path = Path(output_path)
-        self.chunk_size = chunk_size
+        self._reader = reader
+        self._output_path = Path(output_path)
+        self._chunk_samples = chunk_samples
 
     def write(self) -> Path:
-        """
-        Write the NWB file.
-
-        Returns:
-            Path to the created NWB file.
-        """
-        log.info("Creating NWB file: %s", self.output_path)
-        log.info("  Channels: %d", self.reader.num_channels)
-        log.info("  Samples: %d", self.reader.num_samples)
-        log.info("  Rate: %.2f Hz", self.reader.sampling_rate)
-        log.info("  Has gaps: %s", self.reader.has_gaps())
-
-        # Create NWB file structure
-        nwbfile = self._create_nwb_file()
-
-        # Create device and electrode group
-        device = self._create_device(nwbfile)
-        electrode_group = self._create_electrode_group(nwbfile, device)
-
-        # Add electrodes to table
-        self._add_electrodes(nwbfile, electrode_group)
-
-        # Create electrode table region
-        electrode_region = nwbfile.create_electrode_table_region(
-            region=list(range(self.reader.num_channels)),
-            description="All MEF electrodes"
+        log.info(
+            "Writing NWB: %d channels, %d samples, %.2f Hz",
+            self._reader.num_channels,
+            self._reader.num_samples,
+            self._reader.sampling_rate,
         )
 
-        # Create ElectricalSeries with data
-        electrical_series = self._create_electrical_series(electrode_region)
-        nwbfile.add_acquisition(electrical_series)
-
-        # Write to file
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        log.info("Writing NWB file to: %s", self.output_path)
-
-        with NWBHDF5IO(str(self.output_path), mode="w") as io:
-            io.write(nwbfile)
-
-        file_size_mb = self.output_path.stat().st_size / (1024 * 1024)
-        log.info("NWB file written successfully: %.2f MB", file_size_mb)
-
-        return self.output_path
-
-    def _create_nwb_file(self) -> NWBFile:
-        """Create the base NWB file with metadata."""
-        identifier = f"mef_nwb_{uuid.uuid4().hex[:8]}"
-
-        nwbfile = NWBFile(
-            session_description="MEF converted timeseries data",
-            identifier=identifier,
-            session_start_time=self.reader.session_start_time,
-            experimenter=None,
-            lab=None,
-            institution=None,
-            experiment_description="Timeseries data converted from MEF format",
-        )
-
-        log.info("Created NWBFile: %s", identifier)
-        log.info("  Session start: %s", self.reader.session_start_time.isoformat())
-
-        return nwbfile
-
-    def _create_device(self, nwbfile: NWBFile):
-        """Create the recording device."""
-        device = nwbfile.create_device(
-            name="MEFDevice",
-            description="MEF recording device",
-            manufacturer="Unknown",
-        )
-        return device
-
-    def _create_electrode_group(self, nwbfile: NWBFile, device):
-        """Create the electrode group."""
-        electrode_group = nwbfile.create_electrode_group(
-            name="MEFElectrodeGroup",
-            description="Electrodes from MEF recording",
+        nwb = self._create_nwb_file()
+        device = nwb.create_device(name="MEFDevice", description="MEF recording system")
+        group = nwb.create_electrode_group(
+            name="MEFElectrodes",
+            description="Channels from MEF recording",
             location="Unknown",
             device=device,
         )
-        return electrode_group
 
-    def _add_electrodes(self, nwbfile: NWBFile, electrode_group) -> None:
-        """Add electrodes to the electrode table."""
-        nwbfile.add_electrode_column(
-            name="channel_name",
-            description="Channel name from MEF recording"
-        )
-
-        for name in self.reader.channel_names:
-            nwbfile.add_electrode(
+        nwb.add_electrode_column(name="channel_name", description="Original channel name")
+        for name in self._reader.channel_names:
+            nwb.add_electrode(
                 x=0.0, y=0.0, z=0.0,
                 imp=np.nan,
                 location="Unknown",
                 filtering="Unknown",
-                group=electrode_group,
+                group=group,
                 channel_name=name,
             )
 
-        log.info("Added %d electrodes", self.reader.num_channels)
+        electrodes = nwb.create_electrode_table_region(
+            region=list(range(self._reader.num_channels)),
+            description="All electrodes",
+        )
 
-    def _create_electrical_series(self, electrode_region) -> ElectricalSeries:
-        """Create the ElectricalSeries with data."""
-        num_samples = self.reader.num_samples
-        num_channels = self.reader.num_channels
+        series = self._create_electrical_series(electrodes)
+        nwb.add_acquisition(series)
 
-        log.info("Creating ElectricalSeries with MEFDataChunkIterator")
-        log.info("  Shape: (%d, %d)", num_samples, num_channels)
-        log.info("  Chunk size: %d samples", self.chunk_size)
+        self._output_path.parent.mkdir(parents=True, exist_ok=True)
+        with NWBHDF5IO(str(self._output_path), mode="w") as io:
+            io.write(nwb)
 
-        # Create custom chunk iterator
-        data_iterator = MEFDataChunkIterator(self.reader, self.chunk_size)
+        size_mb = self._output_path.stat().st_size / (1024 * 1024)
+        log.info("Wrote %s (%.1f MB)", self._output_path, size_mb)
+        return self._output_path
 
-        # Decide whether to use rate or timestamps based on gaps
-        if self.reader.has_gaps():
+    def _create_nwb_file(self) -> NWBFile:
+        return NWBFile(
+            session_description="MEF timeseries data",
+            identifier=f"mef_{uuid.uuid4().hex[:8]}",
+            session_start_time=self._reader.session_start_time,
+            experiment_description="Converted from MEF format",
+        )
+
+    def _create_electrical_series(self, electrodes) -> ElectricalSeries:
+        data = _ChunkedDataIterator(self._reader, self._chunk_samples)
+
+        if self._reader.has_gaps():
             log.info("Using explicit timestamps (gaps detected)")
-            timestamps = self.reader.get_timestamps_seconds()
-
-            electrical_series = ElectricalSeries(
-                name="MEFElectricalSeries",
-                description="Timeseries data converted from MEF format",
-                data=data_iterator,
-                electrodes=electrode_region,
-                timestamps=timestamps,
-                conversion=1.0,  # Data is in raw counts
+            return ElectricalSeries(
+                name="ElectricalSeries",
+                description="MEF timeseries data",
+                data=data,
+                electrodes=electrodes,
+                timestamps=self._reader.get_timestamps_seconds(),
+                conversion=1.0,
                 offset=0.0,
             )
         else:
-            log.info("Using constant rate (no gaps)")
-
-            electrical_series = ElectricalSeries(
-                name="MEFElectricalSeries",
-                description="Timeseries data converted from MEF format",
-                data=data_iterator,
-                electrodes=electrode_region,
-                rate=self.reader.sampling_rate,
-                conversion=1.0,  # Data is in raw counts
-                offset=0.0,
+            log.info("Using constant rate (continuous)")
+            return ElectricalSeries(
+                name="ElectricalSeries",
+                description="MEF timeseries data",
+                data=data,
+                electrodes=electrodes,
+                rate=self._reader.sampling_rate,
                 starting_time=0.0,
+                conversion=1.0,
+                offset=0.0,
             )
-
-        return electrical_series

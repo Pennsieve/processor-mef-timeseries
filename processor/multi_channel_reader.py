@@ -1,14 +1,14 @@
-# processor/multi_channel_reader.py
 """
-Multi-channel reader that aggregates staged channels for NWB construction.
-Memory-efficient: loads metadata upfront, reads binary data on-demand.
+Memory-efficient reader for staged MEF channel data.
+
+Loads only JSON metadata on init; binary sample data is read on-demand
+via memory-mapped files during NWB construction.
 """
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
 
 import numpy as np
 
@@ -16,143 +16,118 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
-class SegmentInfo:
-    """Metadata for a binary segment file."""
+class Segment:
     start_us: int
     end_us: int
     n_samples: int
-    data_path: str
+    path: str
 
 
 @dataclass
-class ChannelMetadata:
-    """Channel metadata loaded from JSON."""
+class Channel:
     name: str
     rate_hz: float
     unit: str
-    segments: List[SegmentInfo]
+    segments: list[Segment]
     total_samples: int
 
 
 class MultiChannelReader:
     """
-    Aggregates staged channels for NWB construction.
+    Provides unified access to multi-channel MEF data for NWB conversion.
 
-    Memory-efficient: only loads JSON metadata upfront,
-    reads binary data in chunks during write phase.
+    All channels are assumed to be temporally aligned with matching sample rates.
     """
 
     @classmethod
-    def from_staged_dir(cls, staged_dir: Path) -> "MultiChannelReader":
-        """
-        Create reader from a directory containing staged channel JSON files.
-
-        A valid channel JSON must be a dict with a "segments" list containing
-        at least one segment with a "data_path" ending in ".bin".
-        """
-        json_paths = []
-        for json_file in sorted(staged_dir.glob("*.json")):
+    def from_staged_dir(cls, directory: Path) -> "MultiChannelReader":
+        """Load all valid channel manifests from a staging directory."""
+        paths = []
+        for path in sorted(directory.glob("*.json")):
             try:
-                with json_file.open() as f:
+                with path.open() as f:
                     data = json.load(f)
-
                 if not isinstance(data, dict):
                     continue
-
-                segments = data.get("segments")
-                if not isinstance(segments, list):
-                    continue
-
-                has_bin = any(
-                    isinstance(s, dict) and str(s.get("data_path", "")).endswith(".bin")
-                    for s in segments
-                )
-                if has_bin:
-                    json_paths.append(json_file)
+                segments = data.get("segments", [])
+                if any(str(s.get("data_path", "")).endswith(".bin") for s in segments):
+                    paths.append(path)
             except Exception as e:
-                log.warning("Skipping %s: %s", json_file.name, e)
+                log.warning("Skipping %s: %s", path.name, e)
 
-        if not json_paths:
-            raise ValueError(f"No valid channel JSON files in {staged_dir}")
+        if not paths:
+            raise ValueError(f"No valid channel manifests in {directory}")
+        return cls(paths)
 
-        return cls(json_paths)
+    def __init__(self, manifest_paths: list[Path]):
+        if not manifest_paths:
+            raise ValueError("No manifest paths provided")
 
-    def __init__(self, channel_json_paths: List[Path]):
-        if not channel_json_paths:
-            raise ValueError("No channel JSON paths provided")
+        self._channels = [
+            self._parse_manifest(p)
+            for p in sorted(manifest_paths, key=lambda p: p.stem)
+        ]
+        log.info("Loaded %d channels", len(self._channels))
 
-        self._channels: List[ChannelMetadata] = []
-        for json_path in sorted(channel_json_paths, key=lambda p: p.stem):
-            self._channels.append(self._load_metadata(json_path))
+        self._validate_channels()
+        self._session_start_us, self._session_start_time = self._compute_session_start()
+        self._has_gaps = self._check_for_gaps()
 
-        log.info("Loaded metadata for %d channels", len(self._channels))
-
-        self._validate_alignment()
-        self._compute_session_start()
-        self._has_gaps = self._detect_gaps()
-
-    def _load_metadata(self, json_path: Path) -> ChannelMetadata:
-        """Load channel metadata from JSON."""
-        with json_path.open() as f:
+    def _parse_manifest(self, path: Path) -> Channel:
+        with path.open() as f:
             data = json.load(f)
 
         segments = []
-        total_samples = 0
-        for seg in sorted(data["segments"], key=lambda s: int(s["start_us"])):
-            seg_info = SegmentInfo(
-                start_us=int(seg["start_us"]),
-                end_us=int(seg["end_us"]),
-                n_samples=int(seg["n_samples"]),
-                data_path=str((json_path.parent / seg["data_path"]).resolve()),
+        total = 0
+        for s in sorted(data["segments"], key=lambda x: x["start_us"]):
+            seg = Segment(
+                start_us=int(s["start_us"]),
+                end_us=int(s["end_us"]),
+                n_samples=int(s["n_samples"]),
+                path=str((path.parent / s["data_path"]).resolve()),
             )
-            segments.append(seg_info)
-            total_samples += seg_info.n_samples
+            segments.append(seg)
+            total += seg.n_samples
 
-        return ChannelMetadata(
+        return Channel(
             name=data["name"],
             rate_hz=float(data["rate_hz"]),
-            unit=str(data.get("unit", "counts")),
+            unit=data.get("unit", "counts"),
             segments=segments,
-            total_samples=total_samples,
+            total_samples=total,
         )
 
-    def _validate_alignment(self) -> None:
-        """Warn if channels have misaligned sample counts or rates."""
+    def _validate_channels(self):
         ref = self._channels[0]
         for ch in self._channels[1:]:
             if abs(ch.total_samples - ref.total_samples) > 100:
                 log.warning(
-                    "Channel '%s' has %d samples, expected ~%d",
-                    ch.name, ch.total_samples, ref.total_samples
+                    "Sample count mismatch: %s has %d (expected %d)",
+                    ch.name, ch.total_samples, ref.total_samples,
                 )
-            if abs(1 - (ch.rate_hz / ref.rate_hz)) > 0.02:
+            if ref.rate_hz and abs(1 - ch.rate_hz / ref.rate_hz) > 0.02:
                 log.warning(
-                    "Channel '%s' has rate %.2f Hz, expected ~%.2f Hz",
-                    ch.name, ch.rate_hz, ref.rate_hz
+                    "Rate mismatch: %s has %.2f Hz (expected %.2f Hz)",
+                    ch.name, ch.rate_hz, ref.rate_hz,
                 )
 
-    def _compute_session_start(self) -> None:
-        """Compute session start from earliest segment timestamp."""
-        min_start_us = min(
-            ch.segments[0].start_us for ch in self._channels if ch.segments
-        )
-        self._session_start_us = min_start_us
-        self._session_start_time = datetime.fromtimestamp(
-            min_start_us / 1e6, tz=timezone.utc
-        )
-        log.info("Session start: %s", self._session_start_time.isoformat())
+    def _compute_session_start(self) -> tuple[int, datetime]:
+        start_us = min(ch.segments[0].start_us for ch in self._channels)
+        start_time = datetime.fromtimestamp(start_us / 1e6, tz=timezone.utc)
+        log.info("Session start: %s", start_time.isoformat())
+        return start_us, start_time
 
-    def _detect_gaps(self) -> bool:
-        """Check if there are discontinuities between segments."""
+    def _check_for_gaps(self) -> bool:
         ref = self._channels[0]
-        if len(ref.segments) <= 1:
+        if len(ref.segments) < 2:
             return False
 
-        gap_threshold_us = (1_000_000.0 / ref.rate_hz) * 2  # 2x sample period
+        threshold_us = 2 * (1_000_000 / ref.rate_hz)
         for i in range(1, len(ref.segments)):
             gap = ref.segments[i].start_us - ref.segments[i - 1].end_us
-            if gap > gap_threshold_us:
-                log.info("Gap detected: %d us between segments %d and %d", gap, i - 1, i)
+            if gap > threshold_us:
+                log.info("Gap detected: %.1f ms between segments %d-%d",
+                         gap / 1000, i - 1, i)
                 return True
         return False
 
@@ -162,7 +137,6 @@ class MultiChannelReader:
 
     @property
     def num_samples(self) -> int:
-        """Minimum sample count across all channels."""
         return min(ch.total_samples for ch in self._channels)
 
     @property
@@ -174,65 +148,59 @@ class MultiChannelReader:
         return self._session_start_time
 
     @property
-    def channel_names(self) -> List[str]:
+    def channel_names(self) -> list[str]:
         return [ch.name for ch in self._channels]
 
     def has_gaps(self) -> bool:
         return self._has_gaps
 
     def get_timestamps_seconds(self) -> np.ndarray:
-        """Get timestamps relative to session start, in seconds."""
+        """Compute timestamps relative to session start for all samples."""
         ref = self._channels[0]
-        period_us = 1_000_000.0 / ref.rate_hz
+        period_us = 1_000_000 / ref.rate_hz
 
-        timestamps_list = []
+        arrays = []
         for seg in ref.segments:
-            if seg.n_samples <= 0:
-                continue
-            indices = np.arange(seg.n_samples, dtype=np.float64)
-            timestamps_list.append(seg.start_us + indices * period_us)
+            if seg.n_samples > 0:
+                t = seg.start_us + np.arange(seg.n_samples, dtype=np.float64) * period_us
+                arrays.append(t)
 
-        if not timestamps_list:
+        if not arrays:
             return np.array([], dtype=np.float64)
 
-        all_ts = np.concatenate(timestamps_list)
-        return (all_ts[:self.num_samples] - self._session_start_us) / 1e6
+        timestamps_us = np.concatenate(arrays)[: self.num_samples]
+        return (timestamps_us - self._session_start_us) / 1e6
 
     def read_all_channels(self, start: int, end: int) -> np.ndarray:
-        """Read samples [start:end) from all channels. Returns (samples, channels)."""
-        result = np.empty((end - start, self.num_channels), dtype=np.float64)
-        for ch_idx, ch in enumerate(self._channels):
-            result[:, ch_idx] = self._read_range(ch, start, end)
-        return result
+        """Read sample range [start, end) from all channels."""
+        data = np.empty((end - start, self.num_channels), dtype=np.float64)
+        for i, ch in enumerate(self._channels):
+            data[:, i] = self._read_channel(ch, start, end)
+        return data
 
-    def _read_range(self, ch: ChannelMetadata, start: int, end: int) -> np.ndarray:
-        """Read sample range from a single channel's segment files."""
+    def _read_channel(self, channel: Channel, start: int, end: int) -> np.ndarray:
         out = np.full(end - start, np.nan, dtype=np.float64)
-        dtype = "<i4" if ch.unit.lower() == "counts" else "<f8"
+        dtype = "<i4" if channel.unit.lower() == "counts" else "<f8"
 
-        # Build cumulative sample offsets
-        offsets = [0]
-        for seg in ch.segments:
-            offsets.append(offsets[-1] + seg.n_samples)
+        cumulative = 0
+        for seg in channel.segments:
+            seg_start = cumulative
+            seg_end = cumulative + seg.n_samples
+            cumulative = seg_end
 
-        # Read from overlapping segments
-        for i, seg in enumerate(ch.segments):
-            seg_start, seg_end = offsets[i], offsets[i + 1]
             if seg_end <= start or seg_start >= end:
                 continue
 
-            # Compute overlap
             read_start = max(start, seg_start)
             read_end = min(end, seg_end)
 
-            # Map to local segment indices and output indices
             local_start = read_start - seg_start
             local_end = read_end - seg_start
             out_start = read_start - start
             out_end = read_end - start
 
-            mm = np.memmap(seg.data_path, dtype=dtype, mode="r", shape=(seg.n_samples,))
-            out[out_start:out_end] = mm[local_start:local_end].astype(np.float64)
-            del mm
+            mmap = np.memmap(seg.path, dtype=dtype, mode="r", shape=(seg.n_samples,))
+            out[out_start:out_end] = mmap[local_start:local_end].astype(np.float64)
+            del mmap
 
         return out

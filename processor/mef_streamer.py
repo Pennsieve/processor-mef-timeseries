@@ -1,7 +1,14 @@
-# processor/mef_streamer.py
 """
-MEF streaming from Java subprocess.
-Reads binary frames from mefstreamer.jar and stages channel data as .bin/.json files.
+Stream MEF data from Java subprocess and stage as binary/JSON files.
+
+The mefstreamer.jar emits a binary protocol:
+  - Frame header: 1 byte type + 4 bytes little-endian length
+  - Frame types: CHANNEL_META (1), SEGMENT_START (2), SAMPLES_INT32 (3),
+                 SEGMENT_END (4), END (5)
+
+Output per channel:
+  - <channel>_seg000.bin, _seg001.bin, ... : int32 little-endian samples
+  - <channel>.json : metadata with segment boundaries
 """
 import json
 import logging
@@ -11,40 +18,36 @@ import struct
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 log = logging.getLogger(__name__)
 
-# Frame types from MEFStreamer Java app
+# Frame types
 CHANNEL_META = 1
 SEGMENT_START = 2
 SAMPLES_INT32 = 3
 SEGMENT_END = 4
 END = 5
 
-HEADER_SIZE = 5  # 1 byte type + 4 bytes length
+_HEADER_SIZE = 5
+_LOG_INTERVAL_BYTES = 64 * 1024 * 1024
 
 
-def _safe_name(name: str) -> str:
-    """Sanitize channel name for use as filename."""
-    base = re.sub(r"[^\w\-.]+", "_", name).strip("_")
-    return base or "channel"
+def _sanitize_filename(name: str) -> str:
+    sanitized = re.sub(r"[^\w\-.]+", "_", name).strip("_")
+    return sanitized or "channel"
 
 
-def _read_frames(stream, timeout: int = 30):
-    """
-    Generator yielding (frame_type, payload) from Java byte stream.
-
-    Frame structure: 1 byte type, 4 bytes length (little-endian), then payload.
-    """
+def _iter_frames(stream, timeout_sec: int = 300):
+    """Yield (frame_type, payload) tuples from the Java process stdout."""
     fd = stream.fileno()
     while True:
-        readable, _, _ = select.select([fd], [], [], timeout)
+        readable, _, _ = select.select([fd], [], [], timeout_sec)
         if not readable:
-            raise TimeoutError(f"No data from Java for {timeout}s")
+            raise TimeoutError(f"No data received for {timeout_sec}s")
 
-        header = stream.read(HEADER_SIZE)
-        if not header or len(header) < HEADER_SIZE:
+        header = stream.read(_HEADER_SIZE)
+        if len(header) < _HEADER_SIZE:
             return
 
         frame_type = header[0]
@@ -56,161 +59,167 @@ def _read_frames(stream, timeout: int = 30):
         yield frame_type, payload
 
 
-def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> None:
+def stage_from_stream(java_cmd: list[str], output_dir: Path) -> None:
     """
-    Launch Java MEF streamer and write staged files.
+    Run MEF streamer and write staged channel files.
 
-    Creates for each channel:
-      - <name>_seg000.bin, <name>_seg001.bin, ... (int32 LE sample data)
-      - <name>.json (channel metadata with segment info)
+    Args:
+        java_cmd: Command to launch mefstreamer.jar
+        output_dir: Directory for staged .bin and .json files
     """
-    staged_dir.mkdir(parents=True, exist_ok=True)
-    log.info("Staging MEF data -> %s", staged_dir)
-    log.info("Starting: %s", " ".join(java_cmd))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Staging to %s", output_dir)
 
     proc = subprocess.Popen(
-        java_cmd,
-        stdout=subprocess.PIPE,
-        stderr=None,
-        bufsize=1024 * 1024,
+        java_cmd, stdout=subprocess.PIPE, stderr=None, bufsize=1024 * 1024
     )
-    log.info("Java PID %s", proc.pid)
-    assert proc.stdout is not None
+    log.info("Started MEF streamer (PID %d): %s", proc.pid, " ".join(java_cmd))
 
-    # Channel state
-    ch_meta: Dict[str, Any] = {}
-    ch_name = ""
-    ch_base = ""
-    ch_rate_hz = 0.0
-    observed_start_us: int | None = None
-    observed_end_us = -(2**63)
-    seg_index = -1
-    seg_file = None
-    seg_samples = 0
-    segments: List[Dict[str, Any]] = []
-
-    # Progress tracking
-    bytes_written = 0
-    last_log_bytes = 0
-    t0 = time.monotonic()
-    LOG_INTERVAL = 64 * 1024 * 1024  # 64MB
-
-    def close_segment(end_us: int | None = None, expected_samples: int | None = None):
-        nonlocal seg_file, seg_samples, observed_end_us, bytes_written, last_log_bytes
-        if seg_file is None:
-            return
-
-        seg_file.close()
-        seg_file = None
-
-        if expected_samples is not None and expected_samples != seg_samples:
-            log.warning("Sample mismatch: expected=%d actual=%d", expected_samples, seg_samples)
-
-        segments[-1]["n_samples"] = seg_samples
-        if end_us is not None:
-            segments[-1]["end_us"] = int(end_us)
-            observed_end_us = max(observed_end_us, int(end_us))
-
-        seg_samples = 0
-        bytes_written = 0
-        last_log_bytes = 0
-
-    def flush_channel():
-        nonlocal ch_meta, ch_name, ch_base, ch_rate_hz, segments
-        nonlocal observed_start_us, observed_end_us, seg_index
-
-        if not ch_name:
-            return
-        if seg_file is not None:
-            close_segment()
-
-        data = {
-            "name": ch_name,
-            "type": ch_meta.get("type", "Unknown"),
-            "description": ch_meta.get("description", "Unknown signal type"),
-            "unit": "counts",
-            "low_cut_hz": ch_meta.get("low_cut_hz", -1.0),
-            "high_cut_hz": ch_meta.get("high_cut_hz", -1.0),
-            "rate_hz": ch_rate_hz,
-            "absolute_start_us": int(observed_start_us) if observed_start_us else 0,
-            "absolute_end_us": int(observed_end_us),
-            "segments": segments,
-        }
-        json_path = staged_dir / f"{ch_base}.json"
-        json_path.write_text(json.dumps(data, indent=2))
-        log.info("Wrote %s (%d segments)", json_path.name, len(segments))
-
-        # Reset
-        ch_meta = {}
-        ch_name = ""
-        ch_base = ""
-        ch_rate_hz = 0.0
-        observed_start_us = None
-        observed_end_us = -(2**63)
-        seg_index = -1
-        segments = []
+    state = _ChannelState(output_dir)
 
     try:
-        for ftype, payload in _read_frames(proc.stdout, timeout=300):
-            if ftype == CHANNEL_META:
-                flush_channel()
+        for frame_type, payload in _iter_frames(proc.stdout):
+            if frame_type == CHANNEL_META:
+                state.flush()
                 meta = json.loads(payload.decode("utf-8"))
-                ch_meta = meta
-                ch_name = meta.get("name", "channel")
-                ch_base = _safe_name(ch_name)
-                ch_rate_hz = float(meta.get("rate_hz", 0.0))
-                log.info("Channel: %s @ %.2f Hz", ch_name, ch_rate_hz)
+                state.begin_channel(meta)
 
-            elif ftype == SEGMENT_START:
+            elif frame_type == SEGMENT_START:
                 start_us, rate_hz = struct.unpack("<qd", payload)
-                ch_rate_hz = float(rate_hz)
-                if observed_start_us is None:
-                    observed_start_us = int(start_us)
+                state.begin_segment(start_us, rate_hz)
 
-                seg_index += 1
-                seg_fname = f"{ch_base}_seg{seg_index:03d}.bin"
-                seg_file = open(staged_dir / seg_fname, "wb", buffering=8 * 1024 * 1024)
-                seg_samples = 0
-                t0 = time.monotonic()
+            elif frame_type == SAMPLES_INT32:
+                state.write_samples(payload)
 
-                segments.append({
-                    "index": seg_index,
-                    "start_us": int(start_us),
-                    "end_us": int(start_us),
-                    "n_samples": 0,
-                    "data_path": seg_fname,
-                })
-                log.info("Segment %d started", seg_index)
-
-            elif ftype == SAMPLES_INT32:
-                if seg_file is None:
-                    raise RuntimeError("SAMPLES_INT32 without open segment")
-                seg_file.write(payload)
-                seg_samples += len(payload) // 4
-                bytes_written += len(payload)
-
-                if bytes_written - last_log_bytes >= LOG_INTERVAL:
-                    mb = bytes_written / (1024 * 1024)
-                    rate = mb / max(time.monotonic() - t0, 1e-6)
-                    log.info("  %.1f MB (%.1f MB/s)", mb, rate)
-                    last_log_bytes = bytes_written
-
-            elif ftype == SEGMENT_END:
+            elif frame_type == SEGMENT_END:
                 end_us, n_samples = struct.unpack("<qq", payload)
-                segments[-1]["end_us"] = int(end_us)
-                observed_end_us = max(observed_end_us, int(end_us))
-                close_segment(end_us=end_us, expected_samples=int(n_samples))
-                log.info("Segment %d complete", seg_index)
+                state.end_segment(end_us, n_samples)
 
-            elif ftype == END:
+            elif frame_type == END:
                 log.info("Stream complete")
                 break
-
     finally:
-        flush_channel()
-        try:
-            rc = proc.wait(timeout=300)
-            log.info("Java exited with code %s", rc)
-        except Exception:
-            log.warning("Terminating Java process")
-            proc.terminate()
+        state.flush()
+        _wait_for_process(proc)
+
+
+def _wait_for_process(proc: subprocess.Popen, timeout: int = 300) -> None:
+    try:
+        rc = proc.wait(timeout=timeout)
+        log.info("MEF streamer exited (code %d)", rc)
+    except subprocess.TimeoutExpired:
+        log.warning("Terminating hung process")
+        proc.terminate()
+
+
+class _ChannelState:
+    """Accumulates state while streaming a single channel."""
+
+    def __init__(self, output_dir: Path):
+        self._output_dir = output_dir
+        self._reset()
+
+    def _reset(self):
+        self._meta: dict[str, Any] = {}
+        self._name = ""
+        self._base_filename = ""
+        self._rate_hz = 0.0
+        self._start_us: int | None = None
+        self._end_us = -(2**63)
+        self._segment_idx = -1
+        self._segment_file = None
+        self._segment_samples = 0
+        self._segments: list[dict] = []
+        self._bytes_written = 0
+        self._last_log_bytes = 0
+        self._t0 = 0.0
+
+    def begin_channel(self, meta: dict):
+        self._meta = meta
+        self._name = meta.get("name", "channel")
+        self._base_filename = _sanitize_filename(self._name)
+        self._rate_hz = float(meta.get("rate_hz", 0.0))
+        log.info("Channel: %s (%.2f Hz)", self._name, self._rate_hz)
+
+    def begin_segment(self, start_us: int, rate_hz: float):
+        self._rate_hz = rate_hz
+        if self._start_us is None:
+            self._start_us = start_us
+
+        self._segment_idx += 1
+        filename = f"{self._base_filename}_seg{self._segment_idx:03d}.bin"
+        self._segment_file = open(
+            self._output_dir / filename, "wb", buffering=8 * 1024 * 1024
+        )
+        self._segment_samples = 0
+        self._bytes_written = 0
+        self._last_log_bytes = 0
+        self._t0 = time.monotonic()
+
+        self._segments.append({
+            "index": self._segment_idx,
+            "start_us": start_us,
+            "end_us": start_us,
+            "n_samples": 0,
+            "data_path": filename,
+        })
+
+    def write_samples(self, data: bytes):
+        if self._segment_file is None:
+            raise RuntimeError("Received samples without active segment")
+
+        self._segment_file.write(data)
+        self._segment_samples += len(data) // 4
+        self._bytes_written += len(data)
+
+        if self._bytes_written - self._last_log_bytes >= _LOG_INTERVAL_BYTES:
+            elapsed = max(time.monotonic() - self._t0, 1e-9)
+            mb = self._bytes_written / (1024 * 1024)
+            log.info("  Written %.1f MB (%.1f MB/s)", mb, mb / elapsed)
+            self._last_log_bytes = self._bytes_written
+
+    def end_segment(self, end_us: int, expected_samples: int):
+        if self._segment_file is None:
+            return
+
+        self._segment_file.close()
+        self._segment_file = None
+
+        if expected_samples != self._segment_samples:
+            log.warning(
+                "Sample count mismatch: expected %d, got %d",
+                expected_samples,
+                self._segment_samples,
+            )
+
+        self._segments[-1]["end_us"] = end_us
+        self._segments[-1]["n_samples"] = self._segment_samples
+        self._end_us = max(self._end_us, end_us)
+
+    def flush(self):
+        if self._segment_file is not None:
+            self._segment_file.close()
+            self._segment_file = None
+
+        if not self._name:
+            self._reset()
+            return
+
+        manifest = {
+            "name": self._name,
+            "type": self._meta.get("type", "Unknown"),
+            "description": self._meta.get("description", ""),
+            "unit": "counts",
+            "rate_hz": self._rate_hz,
+            "low_cut_hz": self._meta.get("low_cut_hz", -1.0),
+            "high_cut_hz": self._meta.get("high_cut_hz", -1.0),
+            "absolute_start_us": self._start_us or 0,
+            "absolute_end_us": self._end_us,
+            "segments": self._segments,
+        }
+
+        json_path = self._output_dir / f"{self._base_filename}.json"
+        json_path.write_text(json.dumps(manifest, indent=2))
+        log.info("Wrote %s (%d segments)", json_path.name, len(self._segments))
+
+        self._reset()
