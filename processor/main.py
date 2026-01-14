@@ -7,6 +7,7 @@ NWB (Neurodata Without Borders) format for downstream analysis pipelines.
 """
 import logging
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -50,6 +51,9 @@ def main():
 
     output_path = output_dir / config.OUTPUT_FILENAME
     NWBWriter(reader, output_path).write()
+
+    shutil.rmtree(staging_dir)
+    log.info("Cleaned up staging directory")
 
     log.info("Conversion complete: %s", output_path)
 
