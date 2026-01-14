@@ -172,25 +172,22 @@ class MEFtoNWBWriter:
 
     def _add_electrodes(self, nwbfile: NWBFile, electrode_group) -> None:
         """Add electrodes to the electrode table."""
-        # Add channel_name column (required by processor-post-timeseries)
         nwbfile.add_electrode_column(
             name="channel_name",
             description="Channel name from MEF recording"
         )
 
-        for ch_info in self.reader.channels:
+        for name in self.reader.channel_names:
             nwbfile.add_electrode(
-                x=0.0,
-                y=0.0,
-                z=0.0,
+                x=0.0, y=0.0, z=0.0,
                 imp=np.nan,
                 location="Unknown",
                 filtering="Unknown",
                 group=electrode_group,
-                channel_name=ch_info.name,
+                channel_name=name,
             )
 
-        log.info("Added %d electrodes to table", self.reader.num_channels)
+        log.info("Added %d electrodes", self.reader.num_channels)
 
     def _create_electrical_series(self, electrode_region) -> ElectricalSeries:
         """Create the ElectricalSeries with data."""
