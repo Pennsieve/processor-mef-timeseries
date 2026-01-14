@@ -3,15 +3,12 @@ import logging
 import os
 import re
 import select
+import shlex
 import struct
 import subprocess
-import sys
 import time
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Any, Dict, List
-
-import numpy as np
 
 from config import Config
 from processor.multi_channel_reader import MultiChannelReader
@@ -316,7 +313,6 @@ if __name__ == "__main__":
             raise RuntimeError("STREAM_FROM_JAR=True but JAVA_CMD not set in Config.")
         # If JAVA_CMD is a string, split it
         if isinstance(java_cmd, str):
-            import shlex
             java_cmd = shlex.split(java_cmd)
 
         staged = stage_from_stream(java_cmd, STAGING_DIR)
