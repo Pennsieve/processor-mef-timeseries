@@ -1,578 +1,62 @@
-import json
-import logging
-import os
-import re
-import select
-import struct
-import subprocess
-import sys
-import requests
-import time
-from pathlib import Path
-from datetime import datetime, timezone
-from typing import Any, Dict, List
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
+#!/usr/bin/env python3
+"""
+MEF to NWB Converter
 
-import numpy as np
+Converts Mayo Clinic MEF (Multiscale Electrophysiology Format) files to
+NWB (Neurodata Without Borders) format for downstream analysis pipelines.
+"""
+import logging
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
 
 from config import Config
-from importer import import_timeseries
-from writer import TimeSeriesChunkWriter
-from processor.single_channel_reader import SingleChannelReader
-from processor.clients.authentication_client import AuthenticationClient
+from processor.mef_streamer import stage_from_stream
+from processor.multi_channel_reader import MultiChannelReader
+from processor.nwb_writer import NWBWriter
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-log = logging.getLogger("processor")
+log = logging.getLogger(__name__)
 
-# MEFStreamer will output these frame types
-CHANNEL_META, SEGMENT_START, SAMPLES_INT32, SEGMENT_END, END = 1, 2, 3, 4, 5
 
-def _iter_channel_jsons(staged_dir: Path) -> list[Path]:
-    """
-    Return only JSON files that look like channel manifests.
-    A valid channel JSON must:
-      - Be a dict
-      - Contain a "segments" key that is a list
-      - Contain at least one segment whose "data_path" ends with ".bin"
-    """
-    return_payload: list[Path] = []
+def main():
+    config = Config()
 
-    for json_file in sorted(staged_dir.glob("*.json")):
-        try:
-            with json_file.open() as f:
-                payload = json.load(f)
+    input_dir = Path(config.INPUT_DIR).resolve()
+    output_dir = Path(config.OUTPUT_DIR).resolve()
+    staging_dir = output_dir / "staging"
 
-            if not isinstance(payload, dict):
-                log.debug("Skipping JSON (not a dict): %s", json_file.name)
-                continue
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
-            segments = payload.get("segments")
-            if not isinstance(segments, list):
-                log.debug("Skipping JSON (no valid 'segments' list): %s", json_file.name)
-                continue
+    log.info("Input: %s", input_dir)
+    log.info("Output: %s", output_dir)
+    subprocess.run(["ls", "-lh", input_dir])
 
-            has_bin_segment = False
-            for seg in segments:
-                if isinstance(seg, dict) and "data_path" in seg:
-                    if str(seg["data_path"]).endswith(".bin"):
-                        has_bin_segment = True
-                        break
+    if config.STREAM_FROM_JAR:
+        stage_from_stream(shlex.split(config.JAVA_CMD), staging_dir)
 
-            if has_bin_segment:
-                return_payload.append(json_file)
-            else:
-                log.debug("Skipping JSON without .bin refs: %s", json_file.name)
-
-        except Exception as e:
-            log.warning("Skipping JSON %s due to error: %s", json_file.name, e)
-
-    return return_payload
-
-
-def _safe_channel_name(name: str) -> str:
-    base = re.sub(r"[^\w\-.]+", "_", name).strip("_")
-    return base or "channel"
-
-
-def _read_frames(stream, timeout: int = 30):
-    """
-    Generator that yields (frame_type, payload) tuples from java byte stream.
-
-    Each frame has the following structure:
-      - Header: 1 byte for frame type, 4 bytes for payload length (little-endian uint32)
-      - Payload: exactly `length` bytes following the header
-    Yields:
-        tuple[int, bytes]: The frame type and the raw payload bytes.
-    """
-    file_descriptor = stream.fileno()
-    while True:
-        is_readable, _, _ = select.select([file_descriptor], [], [], timeout)
-        if not is_readable:
-            raise TimeoutError(f"No data from Java for {timeout}s")
-
-        header_bytes = stream.read(config.HEADER_SIZE)
-        if not header_bytes or len(header_bytes) < config.HEADER_SIZE:
-            return
-
-        frame_type = header_bytes[0]
-        (length,) = struct.unpack("<I", header_bytes[1:5]) # <I is little-endian uint32
-        payload = stream.read(length)
-
-        if len(payload) < length:
-            return
-        yield frame_type, payload
-
-
-def stage_from_stream(java_cmd: List[str], staged_dir: Path) -> List[Path]:
-    """
-    Launch Java app and stage frames into:
-      - <name>_seg%03d.bin (int32 LE counts)
-      - <name>.json
-    Returns list of JSON paths.
-    """
-    staged_dir.mkdir(parents=True, exist_ok=True)
-    log.info("Staging from Java stream -> %s", staged_dir)
-
-    # Inherit stderr so Java logs appear in container logs and won't block.
-    log.info("Starting Java process: %s", " ".join(java_cmd))
-    proc = subprocess.Popen(
-        java_cmd,
-        stdout=subprocess.PIPE,
-        stderr=None,
-        bufsize=1024*1024,  # 1MB pipe buffer
-    )
-    log.info("Java process started with PID %s", proc.pid)
-    assert proc.stdout is not None
-
-    json_paths: List[Path] = []
-
-    # Per-channel state
-    ch_meta: Dict[str, Any] = {}
-    ch_name: str = ""
-    ch_base: str = ""
-    ch_rate_hz: float = 0.0
-    observed_start_us: int | None = None
-    observed_end_us: int = -2**63
-    seg_index: int = -1
-    seg_file = None  # type: ignore
-    seg_samples_written: int = 0
-    segments: List[Dict[str, Any]] = []
-
-    bytes_this_seg = 0
-    last_log_bytes = 0
-    t0 = time.monotonic()
-    BYTES_LOG_CHUNK = 64 * 1024 * 1024  # 64MB
-
-    log.info("Starting to read frames from Java process")
-
-    def close_segment(end_us: int | None = None, n_samples_from_frame: int | None = None):
-        nonlocal seg_file, seg_samples_written, segments, observed_end_us, bytes_this_seg, last_log_bytes
-        log.info("Closing segment: %s", (getattr(seg_file, "name", None) or "None"))
-        if seg_file is None:
-            return
-        seg_file.flush()
-        seg_file.close()
-        seg_file = None
-
-        n_samples = seg_samples_written
-        if n_samples_from_frame is not None and n_samples_from_frame != n_samples:
-            log.warning("Segment sample mismatch: frame=%d written=%d", n_samples_from_frame, n_samples)
-
-        seg = segments[-1]
-        seg["n_samples"] = n_samples
-        if end_us is not None:
-            seg["end_us"] = int(end_us)
-            observed_end_us = max(observed_end_us, int(end_us))
-
-        seg_samples_written = 0
-        bytes_this_seg = 0
-        last_log_bytes = 0
-
-    def flush_channel():
-        nonlocal ch_meta, ch_name, ch_base, ch_rate_hz, segments, observed_start_us, observed_end_us, seg_index
-        log.info("Flushing channel: %s", ch_name or "(none)")
-        if not ch_name:
-            log.warning("No channel name set; skipping flush")
-            return
-        if seg_file is not None:
-            log.warning("Flushing channel with open segment; closing it")
-            close_segment()
-
-        data = {
-            "name": ch_name,
-            "type": ch_meta.get("type", "Unknown"),
-            "description": ch_meta.get("description", "Unknown signal type"),
-            "unit": "counts",
-            "low_cut_hz": ch_meta.get("low_cut_hz", -1.0),
-            "high_cut_hz": ch_meta.get("high_cut_hz", -1.0),
-            "rate_hz": ch_rate_hz,
-            "absolute_start_us": int(observed_start_us) if observed_start_us is not None else 0,
-            "absolute_end_us": int(observed_end_us),
-            "segments": segments,
-        }
-        json_path = staged_dir / f"{ch_base}.json"
-        json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        json_paths.append(json_path)
-        log.info("Wrote channel JSON: %s (segments=%d)", json_path, len(segments))
-
-        # reset
-        ch_meta = {}
-        ch_name = ""
-        ch_base = ""
-        ch_rate_hz = 0.0
-        observed_start_us = None
-        observed_end_us = -2**63
-        seg_index = -1
-        segments = []
-
-    # Frame loop
-    try:
-        for ftype, payload in _read_frames(proc.stdout, timeout=300):
-            if ftype == CHANNEL_META:
-                # finalize previous channel if any
-                flush_channel()
-
-                meta = json.loads(payload.decode("utf-8"))
-                ch_meta = meta
-                ch_name = meta.get("name", "channel")
-                ch_base = _safe_channel_name(ch_name)
-                ch_rate_hz = float(meta.get("rate_hz", 0.0))
-                observed_start_us = None
-                observed_end_us = -2**63
-                segments = []
-                seg_index = -1
-                log.info("META: %s @ %.6f Hz", ch_name, ch_rate_hz)
-
-            elif ftype == SEGMENT_START:
-                start_us, rate_hz = struct.unpack("<qd", payload)
-                ch_rate_hz = float(rate_hz)  # prefer segment rate
-                if observed_start_us is None:
-                    observed_start_us = int(start_us)
-
-                seg_index += 1
-                seg_fname = f"{ch_base}_seg{seg_index:03d}.bin"
-                seg_path = staged_dir / seg_fname
-                seg_file = open(seg_path, "wb",buffering=8*1024*1024)  # 8MB buffer)
-                seg_samples_written = 0
-                bytes_this_seg = 0
-                last_log_bytes = 0
-                t0 = time.monotonic()
-
-                segments.append({
-                    "index": seg_index,
-                    "start_us": int(start_us),
-                    "end_us": int(start_us),  # temp
-                    "n_samples": 0,           # temp
-                    "data_path": seg_fname,
-                })
-                log.info("SEGMENT_START: %s seg%03d start_us=%d -> %s",
-                         ch_name, seg_index, int(start_us), seg_path)
-
-            elif ftype == SAMPLES_INT32:
-                if seg_file is None:
-                    raise RuntimeError("Received SAMPLES_INT32 without an open segment")
-                seg_file.write(payload)
-                seg_samples_written += len(payload) // 4
-                bytes_this_seg += len(payload)
-
-                if bytes_this_seg - last_log_bytes >= BYTES_LOG_CHUNK:
-                    dt = time.monotonic() - t0
-                    mb = bytes_this_seg / (1024 * 1024)
-                    rate = mb / max(dt, 1e-6)
-                    log.info("Streaming %s seg%03d: wrote %.1f MB (%.1f MB/s)",
-                             ch_name, seg_index, mb, rate)
-                    last_log_bytes = bytes_this_seg
-
-            elif ftype == SEGMENT_END:
-                if seg_file is None:
-                    log.warning("SEGMENT_END received but no open segment")
-                    continue
-                end_us, n_samples = struct.unpack("<qq", payload)
-                # update JSON segment fields
-                segments[-1]["end_us"] = int(end_us)
-                observed_end_us = max(observed_end_us, int(end_us))
-                log.info("SEGMENT_END: %s seg%03d end_us=%d n=%d",
-                         ch_name, seg_index, int(end_us), int(n_samples))
-                close_segment(end_us=end_us, n_samples_from_frame=int(n_samples))
-
-            elif ftype == END:
-                log.info("END frame received")
-                break
-
-            else:
-                log.warning("Unknown frame type: %d (len=%d)", ftype, len(payload))
-
-    finally:
-        # finalize last channel if not already flushed
-        flush_channel()
-        # if Java died early, log its return code
-        try:
-            rc = proc.wait(timeout=300)
-            log.info("Java process exited with code %s", rc)
-        except Exception:
-            log.warning("Java process still running; sending SIGTERM")
-            proc.terminate()
-
-    return json_paths
-
-
-def get_start_time(json_path: Path) -> int:
-    with json_path.open() as f:
-        m = json.load(f)
-    return min(int(s["start_us"]) for s in m["segments"]) if m["segments"] else 0
-
-def getIntegrationId():
-    integration_id = os.getenv("INTEGRATION_ID", None)
-    if not integration_id:
-        raise RuntimeError("INTEGRATION_ID environment variable is not set")
-    return integration_id
-
-def get_integration(api_host: str, integration_id: str, session_token: str) -> dict:
-    """
-    Fetch an integration from the API and return its JSON response.
-    Raises an exception if the request fails.
-
-    Args:
-        api_host: The API host URL
-        integration_id: The integration ID to fetch
-        session_token: A valid session/access token for authentication
-
-    Returns:
-        dict: The integration data
-
-    Raises:
-        RuntimeError: If session_token is None or empty
-        requests.HTTPError: If the API request fails (e.g., 403 Forbidden)
-    """
-    if not session_token:
-        raise RuntimeError("session_token is required but was not provided")
-
-    url = f"{api_host}/integrations/{integration_id}"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {session_token}"
-    }
-
-    log.info(f"Fetching integration from: {url}")
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    return response.json()
-
-def get_parent_package_id(package_id: str, token: str, api_host: str) -> str:
-    """
-    Get the parent package ID for a given package.
-
-    Args:
-        package_id: The package ID to query
-        token: A valid session/access token for authentication
-        api_host: The API host URL
-
-    Returns:
-        str: The parent node ID
-
-    Raises:
-        RuntimeError: If token is None or empty
-        requests.HTTPError: If the API request fails
-    """
-    if not token:
-        raise RuntimeError("token is required but was not provided")
-
-    url = f"{api_host}/packages/{package_id}?includeAncestors=true&startAtEpoch=false&limit=100&offset=0"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    log.info(f"Fetching parent package ID for package: {package_id}")
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    package_info = response.json()
-    parent_node_id = package_info["parent"]["content"]["nodeId"]
-
-    return parent_node_id
-
-def update_package_properties(api_host: str, node_id: str, token: str) -> int:
-    """
-    Updates a package's properties on the Pennsieve API.
-
-    Args:
-        api_host (str): The API host (e.g. "api.pennsieve.io")
-        node_id (str): The package (node) ID
-        token (str): An authenticated session token
-
-    Returns:
-        int: The HTTP status code from the response
-    """
-    if not token:
-        raise RuntimeError("token is required but was not provided")
-
-    url = f"{api_host}/packages/{node_id}?updateStorage=true"
-
-    payload = {
-        "properties": [
-            {
-                "key": "subtype",
-                "value": "pennsieve_timeseries",
-                "dataType": "string",
-                "category": "Viewer",
-                "fixed": False,
-                "hidden": True
-            },
-            {
-                "key": "icon",
-                "value": "timeseries",
-                "dataType": "string",
-                "category": "Pennsieve",
-                "fixed": False,
-                "hidden": True
-            }
-        ]
-    }
-
-    headers = {
-        "accept": "*/*",
-        "content-type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    log.info("Updating package %s properties via %s", node_id, url)
-    log.info("Property payload: %s", payload)
-    response = requests.put(url, json=payload, headers=headers)
+    reader = MultiChannelReader.from_staged_dir(staging_dir)
     log.info(
-        "Package %s properties update status: %s %s",
-        node_id,
-        response.status_code,
-        response.reason,
+        "Loaded %d channels, %d samples @ %.2f Hz",
+        reader.num_channels,
+        reader.num_samples,
+        reader.sampling_rate,
     )
-    if response.text:
-        log.info("Property update response body: %s", response.text)
-    return response.status_code
 
-def process_single_channel(args):
-    """Worker function for parallel channel processing"""
-    json_path, index, session_start_time, output_dir, chunk_size_samples = args
-    
-    import logging
-    
-    from processor.single_channel_reader import SingleChannelReader
-    from writer import TimeSeriesChunkWriter
-    
-    log = logging.getLogger(f"processor.channel.{index:05d}")
-    
-    try:
-        reader = SingleChannelReader(str(json_path), staged_dtype="auto", global_index=index)
-        writer = TimeSeriesChunkWriter(session_start_time, output_dir, chunk_size_samples)
-        log.info("Processing channel index %05d (%s)", index, json_path.name)
-        writer.write_electrical_series(reader)
-        log.info("Completed channel index %05d", index)
-        return index, True, None
-    except Exception as e:
-        log.error("Failed channel index %05d: %s", index, e, exc_info=True)
-        return index, False, str(e)
+    output_path = output_dir / config.OUTPUT_FILENAME
+    NWBWriter(reader, output_path).write()
+
+    shutil.rmtree(staging_dir)
+    log.info("Cleaned up staging directory")
+
+    log.info("Conversion complete: %s", output_path)
 
 
 if __name__ == "__main__":
-    config = Config()
-
-    BYTES_PER_MB = 2**20
-    BYTES_PER_SAMPLE = 8  # float64 for writer output
-    chunk_size_samples = int(getattr(config, "CHUNK_SIZE_MB", 8) * BYTES_PER_MB / BYTES_PER_SAMPLE)
-
-    INPUT_DIR = Path(getattr(config, "INPUT_DIR", "/data/input")).resolve()
-    OUTPUT_DIR = Path(getattr(config, "OUTPUT_DIR", "/data/output")).resolve()
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    log.info("Listing input dir before running Java:")
-    log.info(f"INPUT_DIR={INPUT_DIR}, OUTPUT_DIR={OUTPUT_DIR}")
-    subprocess.run(["ls", "-lh", INPUT_DIR])
-
-    log.info(getattr(config, "STREAM_FROM_JAR", True))
-    if getattr(config, "STREAM_FROM_JAR", True):
-        java_cmd = getattr(config, "JAVA_CMD", None)
-        if not java_cmd:
-            raise RuntimeError("STREAM_FROM_JAR=True but JAVA_CMD not set in Config.")
-        # If JAVA_CMD is a string, split it
-        if isinstance(java_cmd, str):
-            import shlex
-            java_cmd = shlex.split(java_cmd)
-
-        staged = stage_from_stream(java_cmd, INPUT_DIR)
-        log.info("Staged %d channels", len(staged))
-
-    # Discover staged JSONs (from streaming or pre-staged)
-    chan_jsons = _iter_channel_jsons(INPUT_DIR)
-    if not chan_jsons:
-        raise RuntimeError(f"No channel .json files in {INPUT_DIR}. "
-                        f"Either enable STREAM_FROM_JAR with JAVA_CMD, or pre-stage your channels.")
-
-    session_start_us = min((get_start_time(p) for p in chan_jsons if p.exists()), default=0)
-    session_start_time = datetime.fromtimestamp(session_start_us / 1e6, tz=timezone.utc) if session_start_us else datetime.now(timezone.utc)
-    log.info("Session start (UTC): %s", session_start_time.isoformat())
-
-    
-    channel_args = [
-        (json_path, index, session_start_time, str(OUTPUT_DIR), chunk_size_samples)
-        for index, json_path in enumerate(chan_jsons)
-    ]
-
-    # Start with half CPU cores for testing
-    num_workers = config.NUM_WORKERS
-    log.info("Processing %d channels with %d parallel workers", len(chan_jsons), num_workers)
-
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(process_single_channel, args): args[1] for args in channel_args}
-        
-        completed = 0
-        failed = []  # Track failures
-        
-        for future in as_completed(futures):
-            index = futures[future]  # Get the index from our mapping
-            try:
-                idx, success, error = future.result()
-                completed += 1
-                
-                if success:
-                    log.info("✓ Channel %05d complete (%d/%d)", idx, completed, len(chan_jsons))
-                else:
-                    log.error("✗ Channel %05d FAILED: %s", idx, error)
-                    failed.append(idx)
-                    
-            except Exception as e:
-                # Catch any unexpected exceptions from the worker
-                log.error("✗ Channel %05d CRASHED: %s", index, e, exc_info=True)
-                failed.append(index)
-                completed += 1
-        
-        # Summary
-        log.info("="*80)
-        log.info("Channel processing complete: %d succeeded, %d failed", 
-                len(chan_jsons) - len(failed), len(failed))
-        if failed:
-            log.error("Failed channels: %s", failed)
-            # Optional: Decide if failures should stop the pipeline
-            # raise RuntimeError(f"Failed to process {len(failed)} channels")
-
-
-    # Generate a fresh token right before we need it (the process before this can take hours)
-    log.info("Generating authentication token...")
-
-    if not config.API_KEY or not config.API_SECRET:
-        raise RuntimeError("PENNSIEVE_API_KEY and PENNSIEVE_API_SECRET environment variables must be set")
-
-    auth_client = AuthenticationClient(config.API_HOST)
-    session_token = auth_client.authenticate(config.API_KEY, config.API_SECRET)
-    log.info("Authentication token generated successfully")
-
-    integration_id = config.WORKFLOW_INSTANCE_ID
-    integration_payload = get_integration(config.API_HOST2, integration_id, session_token)
-    package_ids = integration_payload.get("packageIds", None)
-
-    if not package_ids:
-        raise RuntimeError("No packageIds found in integration payload")
-
-    folder_node_id = get_parent_package_id(package_ids[0], session_token, config.API_HOST)
-    if getattr(config, "IMPORTER_ENABLED", False):
-        import_timeseries(
-            config.API_HOST,
-            config.API_HOST2,
-            config.API_KEY,
-            config.API_SECRET,
-            config.WORKFLOW_INSTANCE_ID,
-            folder_node_id,
-            str(OUTPUT_DIR),
-        )
-
-    # Set attributes on collection
-    if folder_node_id:
-        status_code = update_package_properties(config.API_HOST, folder_node_id, session_token)
-        if status_code == 200:
-            log.info(f"Successfully updated package parent folder {folder_node_id} properties")
-        else:
-            log.error(f"Failed to update package parent folder {folder_node_id} properties, status code: {status_code}")
-    else:
-        log.error("No packageId found in integration payload; cannot update package properties")
+    main()
