@@ -300,11 +300,13 @@ if __name__ == "__main__":
 
     INPUT_DIR = Path(getattr(config, "INPUT_DIR", "/data/input")).resolve()
     OUTPUT_DIR = Path(getattr(config, "OUTPUT_DIR", "/data/output")).resolve()
+    STAGING_DIR = OUTPUT_DIR / "staging"
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("Listing input dir before running Java:")
-    log.info(f"INPUT_DIR={INPUT_DIR}, OUTPUT_DIR={OUTPUT_DIR}")
+    log.info(f"INPUT_DIR={INPUT_DIR}, OUTPUT_DIR={OUTPUT_DIR}, STAGING_DIR={STAGING_DIR}")
     subprocess.run(["ls", "-lh", INPUT_DIR])
 
     log.info(getattr(config, "STREAM_FROM_JAR", True))
@@ -317,13 +319,13 @@ if __name__ == "__main__":
             import shlex
             java_cmd = shlex.split(java_cmd)
 
-        staged = stage_from_stream(java_cmd, INPUT_DIR)
+        staged = stage_from_stream(java_cmd, STAGING_DIR)
         log.info("Staged %d channels", len(staged))
 
     # Discover staged JSONs (from streaming or pre-staged)
-    chan_jsons = _iter_channel_jsons(INPUT_DIR)
+    chan_jsons = _iter_channel_jsons(STAGING_DIR)
     if not chan_jsons:
-        raise RuntimeError(f"No channel .json files in {INPUT_DIR}. "
+        raise RuntimeError(f"No channel .json files in {STAGING_DIR}. "
                         f"Either enable STREAM_FROM_JAR with JAVA_CMD, or pre-stage your channels.")
 
     log.info("Found %d channel JSON files", len(chan_jsons))
