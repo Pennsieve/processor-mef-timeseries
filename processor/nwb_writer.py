@@ -7,16 +7,57 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Tuple
 
 import numpy as np
-from hdmf.data_utils import DataChunkIterator
+from hdmf.data_utils import GenericDataChunkIterator
 from pynwb import NWBHDF5IO, NWBFile
 from pynwb.ecephys import ElectricalSeries
 
 from processor.multi_channel_reader import MultiChannelReader
 
 log = logging.getLogger(__name__)
+
+
+class MEFDataChunkIterator(GenericDataChunkIterator):
+    """
+    Custom chunk iterator for MEF data that reads from MultiChannelReader.
+    Provides memory-efficient streaming of data to NWB file.
+    """
+
+    def __init__(self, reader: MultiChannelReader, chunk_size: int = 100_000):
+        self.reader = reader
+        self._chunk_size = chunk_size
+        self._num_samples = reader.num_samples
+        self._num_channels = reader.num_channels
+
+        # Calculate buffer shape (chunk of samples x all channels)
+        buffer_samples = min(chunk_size, self._num_samples)
+
+        super().__init__(
+            buffer_shape=(buffer_samples, self._num_channels),
+            chunk_shape=(buffer_samples, self._num_channels),
+            display_progress=True,
+        )
+
+        log.info("MEFDataChunkIterator initialized:")
+        log.info("  Total samples: %d", self._num_samples)
+        log.info("  Channels: %d", self._num_channels)
+        log.info("  Chunk size: %d samples", buffer_samples)
+
+    def _get_data(self, selection: Tuple[slice, ...]) -> np.ndarray:
+        """Read data for the given selection."""
+        start = selection[0].start
+        stop = selection[0].stop
+        return self.reader.read_all_channels(start, stop).astype(np.float64)
+
+    def _get_maxshape(self) -> Tuple[int, int]:
+        """Return the maximum shape of the data."""
+        return (self._num_samples, self._num_channels)
+
+    def _get_dtype(self) -> np.dtype:
+        """Return the data type."""
+        return np.dtype('float64')
 
 
 class MEFtoNWBWriter:
@@ -157,17 +198,12 @@ class MEFtoNWBWriter:
         num_samples = self.reader.num_samples
         num_channels = self.reader.num_channels
 
-        log.info("Creating ElectricalSeries with DataChunkIterator")
+        log.info("Creating ElectricalSeries with MEFDataChunkIterator")
         log.info("  Shape: (%d, %d)", num_samples, num_channels)
         log.info("  Chunk size: %d samples", self.chunk_size)
 
-        # Create data iterator for memory-efficient writing
-        data_iterator = DataChunkIterator(
-            data=self._data_generator(),
-            maxshape=(num_samples, num_channels),
-            buffer_size=self.chunk_size,
-            dtype=np.float64,
-        )
+        # Create custom chunk iterator
+        data_iterator = MEFDataChunkIterator(self.reader, self.chunk_size)
 
         # Decide whether to use rate or timestamps based on gaps
         if self.reader.has_gaps():
@@ -198,26 +234,3 @@ class MEFtoNWBWriter:
             )
 
         return electrical_series
-
-    def _data_generator(self) -> Iterator[np.ndarray]:
-        """
-        Generator that yields chunks of data for memory-efficient writing.
-
-        Yields:
-            Arrays of shape (chunk_size, num_channels) with float64 values.
-        """
-        num_samples = self.reader.num_samples
-        chunks_written = 0
-        total_chunks = (num_samples + self.chunk_size - 1) // self.chunk_size
-
-        for start in range(0, num_samples, self.chunk_size):
-            end = min(start + self.chunk_size, num_samples)
-            chunk = self.reader.read_all_channels(start, end)
-            chunks_written += 1
-
-            if chunks_written % 10 == 0 or chunks_written == total_chunks:
-                progress = (end / num_samples) * 100
-                log.info("Writing chunk %d/%d (%.1f%% complete)",
-                         chunks_written, total_chunks, progress)
-
-            yield chunk.astype(np.float64)
