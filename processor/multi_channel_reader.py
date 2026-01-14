@@ -42,6 +42,41 @@ class MultiChannelReader:
     reads binary data in chunks during write phase.
     """
 
+    @classmethod
+    def from_staged_dir(cls, staged_dir: Path) -> "MultiChannelReader":
+        """
+        Create reader from a directory containing staged channel JSON files.
+
+        A valid channel JSON must be a dict with a "segments" list containing
+        at least one segment with a "data_path" ending in ".bin".
+        """
+        json_paths = []
+        for json_file in sorted(staged_dir.glob("*.json")):
+            try:
+                with json_file.open() as f:
+                    data = json.load(f)
+
+                if not isinstance(data, dict):
+                    continue
+
+                segments = data.get("segments")
+                if not isinstance(segments, list):
+                    continue
+
+                has_bin = any(
+                    isinstance(s, dict) and str(s.get("data_path", "")).endswith(".bin")
+                    for s in segments
+                )
+                if has_bin:
+                    json_paths.append(json_file)
+            except Exception as e:
+                log.warning("Skipping %s: %s", json_file.name, e)
+
+        if not json_paths:
+            raise ValueError(f"No valid channel JSON files in {staged_dir}")
+
+        return cls(json_paths)
+
     def __init__(self, channel_json_paths: List[Path]):
         if not channel_json_paths:
             raise ValueError("No channel JSON paths provided")
