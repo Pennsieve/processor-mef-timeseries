@@ -124,6 +124,7 @@ class _ChannelState:
         self._name = ""
         self._base_filename = ""
         self._rate_hz = 0.0
+        self._voltage_conversion_factor = 1.0
         self._start_us: int | None = None
         self._end_us = -(2**63)
         self._segment_idx = -1
@@ -139,7 +140,25 @@ class _ChannelState:
         self._name = meta.get("name", "channel")
         self._base_filename = _sanitize_filename(self._name)
         self._rate_hz = float(meta.get("rate_hz", 0.0))
-        log.info("Channel: %s (%.2f Hz)", self._name, self._rate_hz)
+
+        # Microvolts per A/D count, from the MEF header. Samples are raw counts
+        # and mean nothing physically until scaled by this. A jar predating the
+        # field omits it; 1.0 keeps the counts unscaled rather than inventing a
+        # factor, and the warning makes the situation visible.
+        if "voltage_conversion_factor" in meta:
+            self._voltage_conversion_factor = float(meta["voltage_conversion_factor"])
+        else:
+            self._voltage_conversion_factor = 1.0
+            log.warning(
+                "Channel %s: no voltage_conversion_factor in CHANNEL_META; "
+                "assuming 1.0 uV/count (mefstreamer.jar may be out of date)",
+                self._name,
+            )
+
+        log.info(
+            "Channel: %s (%.2f Hz, %g uV/count)",
+            self._name, self._rate_hz, self._voltage_conversion_factor,
+        )
 
     def begin_segment(self, start_us: int, rate_hz: float):
         self._rate_hz = rate_hz
@@ -210,6 +229,7 @@ class _ChannelState:
             "type": self._meta.get("type", "Unknown"),
             "description": self._meta.get("description", ""),
             "unit": "counts",
+            "voltage_conversion_factor": self._voltage_conversion_factor,
             "rate_hz": self._rate_hz,
             "low_cut_hz": self._meta.get("low_cut_hz", -1.0),
             "high_cut_hz": self._meta.get("high_cut_hz", -1.0),

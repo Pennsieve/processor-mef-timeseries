@@ -30,6 +30,9 @@ class Channel:
     unit: str
     segments: list[Segment]
     total_samples: int
+    # Microvolts per A/D count, from the MEF header. Samples are stored as raw
+    # counts; this is what turns them into a physical measurement.
+    voltage_conversion_factor: float = 1.0
 
 
 class MultiChannelReader:
@@ -89,12 +92,22 @@ class MultiChannelReader:
             segments.append(seg)
             total += seg.n_samples
 
+        vcf = data.get("voltage_conversion_factor")
+        if vcf is None:
+            vcf = 1.0
+            log.warning(
+                "Channel %s: manifest has no voltage_conversion_factor; "
+                "assuming 1.0 uV/count (re-stage with a current mefstreamer.jar)",
+                data["name"],
+            )
+
         return Channel(
             name=data["name"],
             rate_hz=float(data["rate_hz"]),
             unit=data.get("unit", "counts"),
             segments=segments,
             total_samples=total,
+            voltage_conversion_factor=float(vcf),
         )
 
     def _validate_channels(self):
@@ -150,6 +163,11 @@ class MultiChannelReader:
     @property
     def channel_names(self) -> list[str]:
         return [ch.name for ch in self._channels]
+
+    @property
+    def voltage_conversion_factors(self) -> list[float]:
+        """Microvolts per count, in the same order as channel_names."""
+        return [ch.voltage_conversion_factor for ch in self._channels]
 
     def has_gaps(self) -> bool:
         return self._has_gaps

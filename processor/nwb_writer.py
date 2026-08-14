@@ -18,6 +18,13 @@ from processor.multi_channel_reader import MultiChannelReader
 
 log = logging.getLogger(__name__)
 
+# NWB fixes ElectricalSeries.unit to "volts": consumers recover volts as
+#     data * conversion * channel_conversion + offset
+# Stored data is raw A/D counts and each channel's MEF voltage conversion factor
+# is in microvolts per count, so channel_conversion carries the per-channel
+# factor and conversion carries the microvolts-to-volts step.
+UV_TO_VOLTS = 1e-6
+
 
 class _ChunkedDataIterator(GenericDataChunkIterator):
     """Streams channel data in chunks to avoid loading entire dataset into memory."""
@@ -118,6 +125,15 @@ class NWBWriter:
     def _create_electrical_series(self, electrodes) -> ElectricalSeries:
         data = _ChunkedDataIterator(self._reader, self._chunk_samples)
 
+        # Per-channel microvolts-per-count, ordered to match the electrode table.
+        channel_conversion = np.array(
+            self._reader.voltage_conversion_factors, dtype=np.float64
+        )
+        log.info(
+            "Voltage conversion factors: %g to %g uV/count across %d channels",
+            channel_conversion.min(), channel_conversion.max(), channel_conversion.size,
+        )
+
         if self._reader.has_gaps():
             log.info("Using explicit timestamps (gaps detected)")
             return ElectricalSeries(
@@ -126,7 +142,8 @@ class NWBWriter:
                 data=data,
                 electrodes=electrodes,
                 timestamps=self._reader.get_timestamps_seconds(),
-                conversion=1.0,
+                conversion=UV_TO_VOLTS,
+                channel_conversion=channel_conversion,
                 offset=0.0,
             )
         else:
@@ -138,6 +155,7 @@ class NWBWriter:
                 electrodes=electrodes,
                 rate=self._reader.sampling_rate,
                 starting_time=0.0,
-                conversion=1.0,
+                conversion=UV_TO_VOLTS,
+                channel_conversion=channel_conversion,
                 offset=0.0,
             )
