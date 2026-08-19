@@ -98,6 +98,23 @@ Environment variables can be set in `dev.env`:
 | `STREAM_FROM_JAR` | `true` | Whether to run the Java MEF streamer |
 | `JAVA_CMD` | (see dev.env) | Command to launch MEF streamer |
 
+### Build arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `EDFWRITER_REF` | `main` | Branch, tag, or commit SHA of `Pennsieve/edfwriter` to build `mefstreamer.jar` from |
+
+The jar is not published anywhere — it is built from source during the image
+build. The Dockerfile checks the named ref's current commit before cloning, so
+a build picks up new edfwriter commits automatically instead of reusing a
+cached clone. Pin a SHA for a reproducible build:
+
+```bash
+EDFWRITER_REF=<sha> docker-compose build
+```
+
+Each build logs the edfwriter commit it used (`edfwriter build ref: <sha>`).
+
 ## Output Format
 
 The converter produces an NWB 2.x file with:

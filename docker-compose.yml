@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Override to pin a tag/SHA: EDFWRITER_REF=<sha> docker-compose build
+        EDFWRITER_REF: ${EDFWRITER_REF:-main}
     env_file:
       - dev.env
     volumes:
