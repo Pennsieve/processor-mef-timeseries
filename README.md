@@ -102,18 +102,18 @@ Environment variables can be set in `dev.env`:
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `EDFWRITER_REF` | `main` | Branch, tag, or commit SHA of `Pennsieve/edfwriter` to build `mefstreamer.jar` from |
+| `MEF2STREAMER_REF` | `main` | Branch, tag, or commit SHA of `Pennsieve/mef2streamer` to build `mefstreamer.jar` from |
 
 The jar is not published anywhere — it is built from source during the image
 build. The Dockerfile checks the named ref's current commit before cloning, so
-a build picks up new edfwriter commits automatically instead of reusing a
+a build picks up new mef2streamer commits automatically instead of reusing a
 cached clone. Pin a SHA for a reproducible build:
 
 ```bash
-EDFWRITER_REF=<sha> docker-compose build
+MEF2STREAMER_REF=<sha> docker-compose build
 ```
 
-Each build logs the edfwriter commit it used (`edfwriter build ref: <sha>`).
+Each build logs the mef2streamer commit it used (`mef2streamer build ref: <sha>`).
 
 ## Output Format
 

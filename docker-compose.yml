@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # Override to pin a tag/SHA: EDFWRITER_REF=<sha> docker-compose build
-        EDFWRITER_REF: ${EDFWRITER_REF:-main}
+        # Override to pin a tag/SHA: MEF2STREAMER_REF=<sha> docker-compose build
+        MEF2STREAMER_REF: ${MEF2STREAMER_REF:-main}
     env_file:
       - dev.env
     volumes:
