@@ -100,16 +100,39 @@ def stage_from_stream(java_cmd: list[str], output_dir: Path) -> None:
                 break
     finally:
         state.flush()
-        _wait_for_process(proc)
+        returncode = _wait_for_process(proc)
+
+    # Checked here rather than in the finally above: raising from a finally
+    # replaces whatever exception is already propagating, and that one names
+    # the real cause. If the frame loop raised, this line is never reached.
+    if returncode is None:
+        raise RuntimeError(
+            "MEF streamer hung and was terminated; its output is in the log "
+            "above"
+        )
+    if returncode != 0:
+        raise RuntimeError(
+            f"MEF streamer failed with exit code {returncode}; its output is "
+            f"in the log above"
+        )
 
 
-def _wait_for_process(proc: subprocess.Popen, timeout: int = 300) -> None:
+def _wait_for_process(proc: subprocess.Popen, timeout: int = 300) -> int | None:
+    """Wait for the streamer to exit and return its code, None if it hung.
+
+    The caller decides what a non-zero code means. Swallowing it here is how a
+    JVM crash mid-conversion came out as "No valid channel manifests": the
+    staging directory was empty for a reason logged twenty lines earlier, and
+    the error pointed at discovery instead.
+    """
     try:
         rc = proc.wait(timeout=timeout)
         log.info("MEF streamer exited (code %d)", rc)
+        return rc
     except subprocess.TimeoutExpired:
         log.warning("Terminating hung process")
         proc.terminate()
+        return None
 
 
 class _ChannelState:
