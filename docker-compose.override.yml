@@ -1,0 +1,25 @@
+# Local development override. Docker Compose merges this automatically, so
+# `make run` picks it up with no extra flags. Delete or rename it to go back to
+# the jar built from GitHub.
+#
+# Mounts a locally-built mef2streamer jar over the one baked into the image.
+# This skips the clone-and-build in the Dockerfile entirely, so you test your
+# working tree rather than whatever is on mef2streamer's main branch.
+#
+# Build the jar first:
+#   cd ../edfwriter && mvn package
+#
+# The path below is the local clone directory, which keeps its old name until
+# you rename or re-clone it -- renaming a repo on GitHub does not rename a
+# checkout you already have. The jar filename is the new one.
+services:
+  processor:
+    volumes:
+      - ./data/input:/data/input
+      - ./data/output:/data/output
+      - ../edfwriter/target/mef2streamer-0.0.1-SNAPSHOT-jar-with-dependencies.jar:/processor/mefstreamer.jar:ro
+    environment:
+      # Convert only these channels, comma-separated, case-insensitive.
+      # Unset or empty converts everything. Quote names containing spaces:
+      #   MEF_CHANNELS="EEG AD 01-Ref,EEG PT 01-Ref" make run
+      MEF_CHANNELS: "${MEF_CHANNELS:-}"
