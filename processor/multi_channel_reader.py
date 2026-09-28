@@ -172,22 +172,35 @@ class MultiChannelReader:
     def has_gaps(self) -> bool:
         return self._has_gaps
 
-    def get_timestamps_seconds(self) -> np.ndarray:
-        """Compute timestamps relative to session start for all samples."""
+    def get_timestamps_seconds(self, start: int, end: int) -> np.ndarray:
+        """Timestamps for sample range [start, end), in seconds from session start.
+
+        Computed per range because a multi-week recording has billions of
+        samples, and the full array would not fit in memory.
+        """
         ref = self._channels[0]
         period_us = 1_000_000 / ref.rate_hz
+        out = np.empty(end - start, dtype=np.float64)
 
-        arrays = []
+        cumulative = 0
         for seg in ref.segments:
-            if seg.n_samples > 0:
-                t = seg.start_us + np.arange(seg.n_samples, dtype=np.float64) * period_us
-                arrays.append(t)
+            seg_start = cumulative
+            seg_end = cumulative + seg.n_samples
+            cumulative = seg_end
 
-        if not arrays:
-            return np.array([], dtype=np.float64)
+            if seg_end <= start or seg_start >= end:
+                continue
 
-        timestamps_us = np.concatenate(arrays)[: self.num_samples]
-        return (timestamps_us - self._session_start_us) / 1e6
+            read_start = max(start, seg_start)
+            read_end = min(end, seg_end)
+
+            # Offset from session start stays an int so float64 keeps
+            # microsecond precision late into a long recording.
+            offset_us = seg.start_us - self._session_start_us
+            local = np.arange(read_start - seg_start, read_end - seg_start, dtype=np.float64)
+            out[read_start - start:read_end - start] = (offset_us + local * period_us) / 1e6
+
+        return out
 
     def read_all_channels(self, start: int, end: int) -> np.ndarray:
         """Read sample range [start, end) from all channels."""

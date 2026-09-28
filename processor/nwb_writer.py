@@ -50,6 +50,27 @@ class _ChunkedDataIterator(GenericDataChunkIterator):
         return np.dtype("float64")
 
 
+class _ChunkedTimestampIterator(GenericDataChunkIterator):
+    """Streams timestamps in chunks. Gapped recordings need one per sample, which
+    is ~15 GB of float64 for a three-week recording, so they can't be built up front."""
+
+    def __init__(self, reader: MultiChannelReader, chunk_samples: int):
+        self._reader = reader
+        self._shape = (reader.num_samples,)
+        buffer = (min(chunk_samples, reader.num_samples),)
+
+        super().__init__(buffer_shape=buffer, chunk_shape=buffer, display_progress=False)
+
+    def _get_data(self, selection: Tuple[slice, ...]) -> np.ndarray:
+        return self._reader.get_timestamps_seconds(selection[0].start, selection[0].stop)
+
+    def _get_maxshape(self) -> Tuple[int]:
+        return self._shape
+
+    def _get_dtype(self) -> np.dtype:
+        return np.dtype("float64")
+
+
 class NWBWriter:
     """
     Writes MEF channel data to NWB format.
@@ -141,7 +162,7 @@ class NWBWriter:
                 description="MEF timeseries data",
                 data=data,
                 electrodes=electrodes,
-                timestamps=self._reader.get_timestamps_seconds(),
+                timestamps=_ChunkedTimestampIterator(self._reader, self._chunk_samples),
                 conversion=UV_TO_VOLTS,
                 channel_conversion=channel_conversion,
                 offset=0.0,
